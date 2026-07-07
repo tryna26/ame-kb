@@ -1,0 +1,26 @@
+[project]
+name = "ame-kb"
+version = "0.1.0"
+description = "Minimal knowledge-graph builder: ingest docs -> LLM extract -> MySQL (nodes/edges/schema)"
+requires-python = ">=3.9"
+dependencies = [
+    "SQLAlchemy>=2.0",
+    "PyMySQL>=1.1",
+    "openai>=1.30",
+    "pydantic>=2.6",
+    "python-dotenv>=1.0",
+    "typer>=0.12",
+]
+
+[project.scripts]
+ame-kb = "ame_kb.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"ame_kb.prompts" = ["*.txt"]
