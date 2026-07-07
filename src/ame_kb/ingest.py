@@ -1,4 +1,7 @@
-"""Ingest: scan a folder for .md/.txt and prepare line-numbered documents.
+"""Ingest: scan a folder for supported sources and prepare line-numbered documents.
+
+Source formats (md/txt/pdf/html) are normalized to plain text by `sources.load`
+before extraction (oceanai's "normalize every source into a doc" idea).
 
 The line-number prefix ([N] ...) is borrowed from oceanai's addLineNumbers:
 it lets the LLM cite source line ranges when it extracts entities.
@@ -9,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List
 
-SUPPORTED_SUFFIXES = {".md", ".txt"}
+from . import sources
 
 
 @dataclass
@@ -37,9 +40,9 @@ def iter_documents(source_dir: str) -> Iterator[Document]:
     if not root.exists():
         raise FileNotFoundError(f"SOURCE_DIR does not exist: {root}")
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
+        if not path.is_file() or not sources.is_supported(path):
             continue
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = sources.load(path)
         if not text.strip():
             continue
         doc_id = str(path.relative_to(root))

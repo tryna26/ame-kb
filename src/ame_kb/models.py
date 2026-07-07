@@ -66,3 +66,17 @@ class GraphEdge(Base):
     update_time: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+
+
+class DocVersion(Base):
+    __tablename__ = "kg_doc_version"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    graph_no: Mapped[str] = mapped_column(String(128), default="default")
+    graph_version: Mapped[int] = mapped_column(BigInteger, default=1)
+    doc_id: Mapped[str] = mapped_column(String(512))
+    content_hash: Mapped[str] = mapped_column(String(64))
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )

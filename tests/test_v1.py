@@ -39,7 +39,7 @@ def test_validate_drops_bad_types_and_endpoints():
     names = {n.name for n in res.nodes}
     assert names == {"Ada", "ACME"}  # Alien dropped
     ada = next(n for n in res.nodes if n.name == "Ada")
-    assert ada.properties == {"title": "x"}  # bogus field stripped
+    assert ada.properties == {"title": "x", "bogus": 1}  # V2: extra field kept
     assert len(res.edges) == 1  # only Ada->ACME works_for survives
     assert res.edges[0].label == "works_for"
     assert len(res.dropped) == 3

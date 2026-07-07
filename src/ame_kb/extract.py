@@ -13,11 +13,15 @@ from pydantic import BaseModel, ValidationError
 from .config import get_settings
 from .ingest import Document
 from .schema import (
-    NODE_FIELDS,
     NODE_TYPE_NAMES,
     edge_endpoints_ok,
     schema_prompt_block,
 )
+
+# Edge provenance labels (borrowed from Graphify). LLM-extracted edges default
+# to INFERRED; a future code (tree-sitter) extractor will emit EXTRACTED.
+CONFIDENCE_LEVELS = {"EXTRACTED", "INFERRED", "AMBIGUOUS"}
+DEFAULT_CONFIDENCE = "INFERRED"
 
 
 class ExtractedNode(BaseModel):
@@ -31,6 +35,7 @@ class ExtractedEdge(BaseModel):
     source_name: str
     target_name: str
     label: str
+    confidence: str = DEFAULT_CONFIDENCE
     source: List[str] = []
 
 
@@ -45,7 +50,7 @@ class ExtractionResult:
 def _load_prompt_template() -> str:
     return (
         resources.files("ame_kb.prompts")
-        .joinpath("extract_v1.txt")
+        .joinpath("extract_v2.txt")
         .read_text(encoding="utf-8")
     )
 
@@ -97,7 +102,11 @@ def call_llm(prompt: str) -> str:
 
 
 def validate(doc_id: str, payload: dict) -> ExtractionResult:
-    """Keep only nodes/edges that satisfy the fixed schema; record drops."""
+    """Keep nodes/edges that satisfy the fixed type schema; record drops.
+
+    Semi-dynamic (V2): node/edge *types* stay fixed, but extra properties the
+    LLM emits are kept in the properties JSON fallback instead of being dropped.
+    """
     result = ExtractionResult(doc_id=doc_id)
     node_type_by_name: Dict[str, str] = {}
 
@@ -110,8 +119,7 @@ def validate(doc_id: str, payload: dict) -> ExtractionResult:
         if node.type not in NODE_TYPE_NAMES:
             result.dropped.append(f"node bad type '{node.type}': {node.name}")
             continue
-        allowed = set(NODE_FIELDS.get(node.type, []))
-        node.properties = {k: v for k, v in node.properties.items() if k in allowed}
+        # Keep all properties (schema-declared + extra) as JSON fallback.
         result.nodes.append(node)
         node_type_by_name[node.name] = node.type
 
@@ -120,6 +128,12 @@ def validate(doc_id: str, payload: dict) -> ExtractionResult:
             edge = ExtractedEdge(**item)
         except ValidationError:
             result.dropped.append(f"edge parse error: {item!r}")
+            continue
+        if edge.confidence not in CONFIDENCE_LEVELS:
+            result.dropped.append(
+                f"edge bad confidence '{edge.confidence}': "
+                f"{edge.source_name}->{edge.target_name}"
+            )
             continue
         src_type = node_type_by_name.get(edge.source_name)
         dst_type = node_type_by_name.get(edge.target_name)

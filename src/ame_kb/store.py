@@ -17,7 +17,8 @@ from sqlalchemy import select
 from .config import get_settings
 from .db import session_scope
 from .extract import ExtractionResult
-from .models import GraphEdge, GraphNode
+from .ingest import Document
+from .models import DocVersion, GraphEdge, GraphNode
 
 
 @dataclass
@@ -26,6 +27,51 @@ class StoreStats:
     nodes_updated: int = 0
     edges_new: int = 0
     edges_updated: int = 0
+
+
+def content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def is_unchanged(doc: Document) -> bool:
+    """Return True if the doc's SHA-256 matches the last stored snapshot."""
+    settings = get_settings()
+    with session_scope() as session:
+        existing = session.execute(
+            select(DocVersion.content_hash).where(
+                DocVersion.graph_no == settings.graph_no,
+                DocVersion.graph_version == settings.graph_version,
+                DocVersion.doc_id == doc.doc_id,
+            )
+        ).scalar_one_or_none()
+        return existing is not None and existing == content_hash(doc.text)
+
+
+def mark_processed(doc: Document) -> None:
+    """Upsert the doc's content hash. Call only after a successful store so a
+    failed extraction never poisons the incremental cache (llm_wiki pattern).
+    """
+    settings = get_settings()
+    new_hash = content_hash(doc.text)
+    with session_scope() as session:
+        existing = session.execute(
+            select(DocVersion).where(
+                DocVersion.graph_no == settings.graph_no,
+                DocVersion.graph_version == settings.graph_version,
+                DocVersion.doc_id == doc.doc_id,
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            session.add(
+                DocVersion(
+                    graph_no=settings.graph_no,
+                    graph_version=settings.graph_version,
+                    doc_id=doc.doc_id,
+                    content_hash=new_hash,
+                )
+            )
+        else:
+            existing.content_hash = new_hash
 
 
 def slug(name: str) -> str:
@@ -109,12 +155,15 @@ def store(result: ExtractionResult) -> StoreStats:
                         source_node_no=src_no,
                         target_node_no=dst_no,
                         name=edge.label,
-                        properties={},
+                        properties={"confidence": edge.confidence},
                         ref=_merge_ref({}, result.doc_id, edge.source),
                     )
                 )
                 stats.edges_new += 1
             else:
+                merged_props = dict(existing.properties or {})
+                merged_props["confidence"] = edge.confidence
+                existing.properties = merged_props
                 existing.ref = _merge_ref(existing.ref, result.doc_id, edge.source)
                 stats.edges_updated += 1
 

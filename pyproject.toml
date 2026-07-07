@@ -10,6 +10,8 @@ dependencies = [
     "pydantic>=2.6",
     "python-dotenv>=1.0",
     "typer>=0.12",
+    "pypdf>=4.0",
+    "trafilatura>=1.8",
 ]
 
 [project.scripts]

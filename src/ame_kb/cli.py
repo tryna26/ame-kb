@@ -12,16 +12,21 @@ from .db import get_engine, ping
 from .extract import extract
 from .query import find_entities, relations_of
 from .schema import seed_schema
-from .store import node_no, store
+from .store import is_unchanged, mark_processed, node_no, store
 
-app = typer.Typer(add_completion=False, help="Minimal knowledge-graph builder (V1).")
+app = typer.Typer(add_completion=False, help="Minimal knowledge-graph builder (V2).")
 
-_SQL_FILE = Path(__file__).resolve().parents[2] / "sql" / "001_init.sql"
+_SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
 
 
 def _run_sql_file(path: Path) -> None:
     raw = path.read_text(encoding="utf-8")
-    statements = [s.strip() for s in raw.split(";") if s.strip()]
+    # Strip full-line `--` comments so a `;` inside a comment can't be mistaken
+    # for a statement separator by the naive split below.
+    body = "\n".join(
+        line for line in raw.splitlines() if not line.lstrip().startswith("--")
+    )
+    statements = [s.strip() for s in body.split(";") if s.strip()]
     with get_engine().begin() as conn:
         for stmt in statements:
             conn.execute(text(stmt))
@@ -29,12 +34,13 @@ def _run_sql_file(path: Path) -> None:
 
 @app.command("init-db")
 def init_db() -> None:
-    """Probe connectivity, create the three tables, and seed the fixed schema."""
+    """Probe connectivity, create the tables, and seed the fixed schema."""
     typer.echo("Checking MySQL connectivity...")
     ping()
     typer.echo("  OK")
-    typer.echo(f"Applying DDL from {_SQL_FILE.name}...")
-    _run_sql_file(_SQL_FILE)
+    for sql_file in sorted(_SQL_DIR.glob("*.sql")):
+        typer.echo(f"Applying DDL from {sql_file.name}...")
+        _run_sql_file(sql_file)
     typer.echo("  tables ready")
     inserted = seed_schema()
     typer.echo(f"Seeded schema: {inserted} new type row(s).")
@@ -44,17 +50,29 @@ def init_db() -> None:
 def ingest_cmd(
     source_dir: str = typer.Option(None, help="Override SOURCE_DIR."),
     dry_run: bool = typer.Option(False, help="Extract and print, do not write DB."),
+    force: bool = typer.Option(
+        False, help="Re-extract even if content hash is unchanged."
+    ),
 ) -> None:
-    """Scan .md/.txt, LLM-extract entities+relations, and store them."""
+    """Scan sources, LLM-extract entities+relations, and store them.
+
+    Incremental: docs whose SHA-256 matches the last run are skipped (unless
+    --force or --dry-run). --dry-run never touches the DB, including hashes.
+    """
     settings = get_settings()
     root = source_dir or settings.source_dir
     docs = ingest_mod.scan(root)
     if not docs:
-        typer.echo(f"No .md/.txt files found under {root}")
+        typer.echo(f"No supported files found under {root}")
         raise typer.Exit(code=0)
 
     typer.echo(f"Found {len(docs)} document(s) under {root}")
+    skipped = 0
     for doc in docs:
+        if not dry_run and not force and is_unchanged(doc):
+            skipped += 1
+            typer.echo(f"\n== {doc.doc_id} == (unchanged, skipped)")
+            continue
         typer.echo(f"\n== {doc.doc_id} ==")
         result = extract(doc)
         typer.echo(f"  extracted: {len(result.nodes)} node(s), {len(result.edges)} edge(s)")
@@ -65,15 +83,19 @@ def ingest_cmd(
                 typer.echo(f"    node  {n.type}: {n.name} {n.properties} src={n.source}")
             for e in result.edges:
                 typer.echo(
-                    f"    edge  {e.source_name} -{e.label}-> {e.target_name} src={e.source}"
+                    f"    edge  {e.source_name} -{e.label}[{e.confidence}]-> "
+                    f"{e.target_name} src={e.source}"
                 )
             continue
         stats = store(result)
+        mark_processed(doc)
         typer.echo(
             "  stored: "
             f"nodes +{stats.nodes_new}/~{stats.nodes_updated}, "
             f"edges +{stats.edges_new}/~{stats.edges_updated}"
         )
+    if skipped:
+        typer.echo(f"\nSkipped {skipped} unchanged document(s).")
 
 
 @app.command("query")
