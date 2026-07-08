@@ -50,6 +50,7 @@ def test_validate_keeps_extra_properties():
     res = validate("doc1", payload)
     ada = res.nodes[0]
     assert ada.properties == {"title": "x", "birth_year": 1815}
+    assert ada.description == ""  # V3: description defaults to empty when absent
 
 
 def test_validate_edge_confidence_default_and_gate():

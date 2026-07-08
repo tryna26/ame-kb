@@ -40,6 +40,7 @@ class GraphNode(Base):
     graph_node_no: Mapped[str] = mapped_column(String(191))
     name: Mapped[str] = mapped_column(String(255), default="")
     type: Mapped[str] = mapped_column(String(64), default="")
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     properties: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     ref: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     deleted: Mapped[int] = mapped_column(Integer, default=0)
@@ -59,6 +60,7 @@ class GraphEdge(Base):
     source_node_no: Mapped[str] = mapped_column(String(191))
     target_node_no: Mapped[str] = mapped_column(String(191))
     name: Mapped[str] = mapped_column(String(64), default="")
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     properties: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     ref: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     deleted: Mapped[int] = mapped_column(Integer, default=0)
@@ -78,5 +80,48 @@ class DocVersion(Base):
     content_hash: Mapped[str] = mapped_column(String(64))
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class Doc(Base):
+    __tablename__ = "kg_doc"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    graph_no: Mapped[str] = mapped_column(String(128), default="default")
+    graph_version: Mapped[int] = mapped_column(BigInteger, default=1)
+    doc_no: Mapped[str] = mapped_column(String(512))
+    path: Mapped[str] = mapped_column(String(1024), default="")
+    title: Mapped[str] = mapped_column(String(512), default="")
+    sha256: Mapped[str] = mapped_column(String(64))
+    source_type: Mapped[str] = mapped_column(String(32), default="")
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DocLine(Base):
+    __tablename__ = "kg_doc_line"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    graph_no: Mapped[str] = mapped_column(String(128), default="default")
+    graph_version: Mapped[int] = mapped_column(BigInteger, default=1)
+    doc_no: Mapped[str] = mapped_column(String(512))
+    line_no: Mapped[int] = mapped_column(Integer)
+    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class SearchIndex(Base):
+    __tablename__ = "kg_search_index"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    graph_no: Mapped[str] = mapped_column(String(128), default="default")
+    graph_version: Mapped[int] = mapped_column(BigInteger, default=1)
+    object_type: Mapped[str] = mapped_column(String(16))
+    object_no: Mapped[str] = mapped_column(String(191))
+    searchable_text: Mapped[str] = mapped_column(Text)
+    embedding: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )

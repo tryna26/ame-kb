@@ -27,6 +27,7 @@ DEFAULT_CONFIDENCE = "INFERRED"
 class ExtractedNode(BaseModel):
     name: str
     type: str
+    description: str = ""
     properties: Dict[str, object] = {}
     source: List[str] = []
 
@@ -35,6 +36,7 @@ class ExtractedEdge(BaseModel):
     source_name: str
     target_name: str
     label: str
+    description: str = ""
     confidence: str = DEFAULT_CONFIDENCE
     source: List[str] = []
 

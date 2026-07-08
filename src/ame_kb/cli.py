@@ -1,22 +1,38 @@
-"""ame-kb V1 CLI: init-db, ingest, query."""
+"""ame-kb V3 CLI: init-db, ingest, query, search, reindex."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import typer
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from . import ingest as ingest_mod
 from .config import get_settings
 from .db import get_engine, ping
 from .extract import extract
 from .query import find_entities, relations_of
+from .recall import recall
+from .reindex import reindex_all
 from .schema import seed_schema
-from .store import is_unchanged, mark_processed, node_no, store
+from .store import is_unchanged, node_no, store
 
-app = typer.Typer(add_completion=False, help="Minimal knowledge-graph builder (V2).")
+app = typer.Typer(add_completion=False, help="Minimal knowledge-graph builder (V3).")
 
 _SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
+
+# Idempotency: init-db reapplies DDL, so tolerate "already exists" style errors
+# from ALTER/CREATE when a column/table is already present.
+_IDEMPOTENT_ERRORS = (
+    "duplicate column name",
+    "already exists",
+    "duplicate key name",
+)
+
+
+def _is_idempotent_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _IDEMPOTENT_ERRORS)
 
 
 def _run_sql_file(path: Path) -> None:
@@ -27,9 +43,17 @@ def _run_sql_file(path: Path) -> None:
         line for line in raw.splitlines() if not line.lstrip().startswith("--")
     )
     statements = [s.strip() for s in body.split(";") if s.strip()]
-    with get_engine().begin() as conn:
-        for stmt in statements:
-            conn.execute(text(stmt))
+    # Run each statement in its own transaction so an idempotent failure (e.g.
+    # a column that already exists) can be skipped without aborting the rest.
+    for stmt in statements:
+        try:
+            with get_engine().begin() as conn:
+                conn.execute(text(stmt))
+        except (OperationalError, ProgrammingError) as exc:
+            if _is_idempotent_error(exc):
+                typer.echo(f"  skip (already applied): {exc.orig}")
+                continue
+            raise
 
 
 @app.command("init-db")
@@ -56,8 +80,9 @@ def ingest_cmd(
 ) -> None:
     """Scan sources, LLM-extract entities+relations, and store them.
 
-    Incremental: docs whose SHA-256 matches the last run are skipped (unless
-    --force or --dry-run). --dry-run never touches the DB, including hashes.
+    Incremental: docs whose SHA-256 matches the last run (kg_doc.sha256) are
+    skipped (unless --force or --dry-run). --dry-run never touches the DB.
+    On store, doc + numbered lines + search index (with embedding) are written.
     """
     settings = get_settings()
     root = source_dir or settings.source_dir
@@ -80,15 +105,18 @@ def ingest_cmd(
             typer.echo(f"  dropped: {d}")
         if dry_run:
             for n in result.nodes:
-                typer.echo(f"    node  {n.type}: {n.name} {n.properties} src={n.source}")
+                typer.echo(
+                    f"    node  {n.type}: {n.name} :: {n.description} "
+                    f"{n.properties} src={n.source}"
+                )
             for e in result.edges:
                 typer.echo(
                     f"    edge  {e.source_name} -{e.label}[{e.confidence}]-> "
-                    f"{e.target_name} src={e.source}"
+                    f"{e.target_name} :: {e.description} src={e.source}"
                 )
             continue
         stats = store(result)
-        mark_processed(doc)
+        ingest_mod.persist_doc(doc)
         typer.echo(
             "  stored: "
             f"nodes +{stats.nodes_new}/~{stats.nodes_updated}, "
@@ -120,6 +148,51 @@ def query_cmd(
                 typer.echo(
                     f"    {arrow} {r.label} [{r.other_type}] {r.other_name}"
                 )
+
+
+@app.command("search")
+def search_cmd(
+    query: str = typer.Argument(..., help="Natural-language query."),
+    window: int = typer.Option(
+        0, help="Expand evidence lines by ±window around each cited line."
+    ),
+) -> None:
+    """Run hybrid recall (FULLTEXT + vector, RRF) and print seeds, neighbors,
+    connecting edges, and the original evidence lines."""
+    res = recall(query, window=window)
+    for w in res.warnings:
+        typer.echo(f"  warning: {w}")
+
+    typer.echo(f"\n# Seeds ({len(res.seeds)})")
+    for s in res.seeds:
+        typer.echo(f"  [{s.type}] {s.name}  ({s.graph_node_no})")
+        if s.description:
+            typer.echo(f"      {s.description}")
+
+    typer.echo(f"\n# Neighbors ({len(res.neighbors)})")
+    for n in res.neighbors:
+        typer.echo(f"  [{n.type}] {n.name}  ({n.graph_node_no})")
+        if n.description:
+            typer.echo(f"      {n.description}")
+
+    typer.echo(f"\n# Edges ({len(res.edges)})")
+    for e in res.edges:
+        typer.echo(
+            f"  {e.source_node_no} -{e.label}-> {e.target_node_no}"
+            + (f"  ({e.description})" if e.description else "")
+        )
+
+    typer.echo(f"\n# Evidence lines ({len(res.evidence)})")
+    for ev in res.evidence:
+        typer.echo(f"  {ev.doc_no}:{ev.line_no}  {ev.content}")
+
+
+@app.command("reindex")
+def reindex_cmd() -> None:
+    """Rebuild kg_search_index (searchable_text + embedding) from current
+    nodes/edges. Useful after enabling/rotating the embedding endpoint."""
+    n_nodes, n_edges = reindex_all()
+    typer.echo(f"Reindexed {n_nodes} node(s) and {n_edges} edge(s).")
 
 
 @app.command("node-no")

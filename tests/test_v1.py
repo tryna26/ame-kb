@@ -25,7 +25,7 @@ def test_schema_prompt_block_lists_types():
 def test_validate_drops_bad_types_and_endpoints():
     payload = {
         "nodes": [
-            {"name": "Ada", "type": "Person", "properties": {"title": "x", "bogus": 1}, "source": ["1-1"]},
+            {"name": "Ada", "type": "Person", "description": "数学家", "properties": {"title": "x", "bogus": 1}, "source": ["1-1"]},
             {"name": "ACME", "type": "Organization", "source": ["2-2"]},
             {"name": "Ghost", "type": "Alien", "source": ["3-3"]},
         ],
@@ -40,6 +40,7 @@ def test_validate_drops_bad_types_and_endpoints():
     assert names == {"Ada", "ACME"}  # Alien dropped
     ada = next(n for n in res.nodes if n.name == "Ada")
     assert ada.properties == {"title": "x", "bogus": 1}  # V2: extra field kept
+    assert ada.description == "数学家"  # V3: description carried through
     assert len(res.edges) == 1  # only Ada->ACME works_for survives
     assert res.edges[0].label == "works_for"
     assert len(res.dropped) == 3
