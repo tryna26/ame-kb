@@ -95,6 +95,30 @@ class Doc(Base):
     title: Mapped[str] = mapped_column(String(512), default="")
     sha256: Mapped[str] = mapped_column(String(64))
     source_type: Mapped[str] = mapped_column(String(32), default="")
+    origin_url: Mapped[str] = mapped_column(String(1024), default="")
+    workspace_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DocChunk(Base):
+    __tablename__ = "kg_doc_chunk"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    graph_no: Mapped[str] = mapped_column(String(128), default="default")
+    graph_version: Mapped[int] = mapped_column(BigInteger, default=1)
+    doc_no: Mapped[str] = mapped_column(String(512))
+    chunk_no: Mapped[str] = mapped_column(String(191))
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    origin_url: Mapped[str] = mapped_column(String(1024), default="")
+    file_path: Mapped[str] = mapped_column(String(1024), default="")
+    line_start: Mapped[int] = mapped_column(Integer, default=0)
+    line_end: Mapped[int] = mapped_column(Integer, default=0)
+    sha256: Mapped[str] = mapped_column(String(64), default="")
+    workspace_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     update_time: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
@@ -122,6 +146,7 @@ class SearchIndex(Base):
     object_no: Mapped[str] = mapped_column(String(191))
     searchable_text: Mapped[str] = mapped_column(Text)
     embedding: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    workspace_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )

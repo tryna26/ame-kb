@@ -25,6 +25,19 @@ class Settings(BaseModel):
     recall_neighbor_topk: int
     min_score_text: float
     min_score_embedding: float
+    # V4: search backend + doc-chunk + multi-hop + retry-ladder knobs.
+    search_backend: str
+    redis_url: str
+    redis_index_prefix: str
+    embed_dim: int
+    chunk_size: int
+    chunk_overlap: int
+    recall_max_queries: int
+    recall_max_hops: int
+    doc_chunk_topk: int
+    recall_min_results: int
+    retry_strict_text: float
+    retry_strict_embedding: float
 
 
 def _require(name: str) -> str:
@@ -53,4 +66,16 @@ def get_settings() -> Settings:
         recall_neighbor_topk=int(os.getenv("RECALL_NEIGHBOR_TOPK", "3")),
         min_score_text=float(os.getenv("MIN_SCORE_TEXT", "0")),
         min_score_embedding=float(os.getenv("MIN_SCORE_EMBEDDING", "0")),
+        search_backend=os.getenv("SEARCH_BACKEND", "mysql"),
+        redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        redis_index_prefix=os.getenv("REDIS_INDEX_PREFIX", "amekb"),
+        embed_dim=int(os.getenv("EMBED_DIM", "0")),
+        chunk_size=int(os.getenv("CHUNK_SIZE", "800")),
+        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "200")),
+        recall_max_queries=int(os.getenv("RECALL_MAX_QUERIES", "1")),
+        recall_max_hops=int(os.getenv("RECALL_MAX_HOPS", "1")),
+        doc_chunk_topk=int(os.getenv("DOC_CHUNK_TOPK", "10")),
+        recall_min_results=int(os.getenv("RECALL_MIN_RESULTS", "0")),
+        retry_strict_text=float(os.getenv("RETRY_STRICT_TEXT", "0.8")),
+        retry_strict_embedding=float(os.getenv("RETRY_STRICT_EMBEDDING", "0.8")),
     )

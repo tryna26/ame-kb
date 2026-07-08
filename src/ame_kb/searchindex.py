@@ -11,15 +11,13 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .config import get_settings
-from .embed import embed_texts, embedding_available
-from .models import SearchIndex
+from .searchbackend import IndexEntry, get_index
 
 NODE = "NODE"
 EDGE = "EDGE"
+DOC_CHUNK = "DOC_CHUNK"
 
 
 def build_searchable_text(
@@ -42,43 +40,22 @@ def build_searchable_text(
 
 
 def upsert_search_index(session: Session, entries: List[Dict]) -> int:
-    """Upsert search-index rows for a batch of objects.
+    """Upsert search-index rows for a batch of objects through the HybridIndex.
 
-    entries: [{"object_type": NODE|EDGE, "object_no": str, "searchable_text": str}]
-    Embeddings are computed in one batch call when the endpoint is available.
-    Returns the number of rows written (inserted + updated).
+    entries: [{"object_type": NODE|EDGE|DOC_CHUNK, "object_no": str,
+               "searchable_text": str}]
+    Embeddings are computed by the backend in one batch call when available.
+    Returns the number of rows written. The caller's `session` is passed through
+    so a SQL backend joins the same transaction.
     """
     if not entries:
         return 0
-    settings = get_settings()
-    texts = [e["searchable_text"] for e in entries]
-    embeddings: List[Optional[List[float]]] = [None] * len(entries)
-    if embedding_available():
-        embeddings = embed_texts(texts)  # type: ignore[assignment]
-
-    written = 0
-    for entry, emb in zip(entries, embeddings):
-        existing = session.execute(
-            select(SearchIndex).where(
-                SearchIndex.graph_no == settings.graph_no,
-                SearchIndex.graph_version == settings.graph_version,
-                SearchIndex.object_type == entry["object_type"],
-                SearchIndex.object_no == entry["object_no"],
-            )
-        ).scalar_one_or_none()
-        if existing is None:
-            session.add(
-                SearchIndex(
-                    graph_no=settings.graph_no,
-                    graph_version=settings.graph_version,
-                    object_type=entry["object_type"],
-                    object_no=entry["object_no"],
-                    searchable_text=entry["searchable_text"],
-                    embedding=emb,
-                )
-            )
-        else:
-            existing.searchable_text = entry["searchable_text"]
-            existing.embedding = emb
-        written += 1
-    return written
+    index_entries = [
+        IndexEntry(
+            object_type=e["object_type"],
+            object_no=e["object_no"],
+            searchable_text=e["searchable_text"],
+        )
+        for e in entries
+    ]
+    return get_index().upsert(index_entries, session=session)

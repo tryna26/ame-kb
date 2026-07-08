@@ -66,6 +66,15 @@ def build_prompt(doc: Document) -> str:
     )
 
 
+def _build_prompt_text(doc_id: str, numbered_text: str) -> str:
+    template = _load_prompt_template()
+    return (
+        template.replace("{{schema_block}}", schema_prompt_block())
+        .replace("{{doc_id}}", doc_id)
+        .replace("{{doc_content}}", numbered_text)
+    )
+
+
 def _extract_json(raw: str) -> dict:
     """Parse a JSON object from the model output, tolerating code fences."""
     raw = raw.strip()
@@ -154,8 +163,30 @@ def validate(doc_id: str, payload: dict) -> ExtractionResult:
     return result
 
 
-def extract(doc: Document) -> ExtractionResult:
-    prompt = build_prompt(doc)
+def _extract_span(doc_id: str, numbered_lines: List[str]) -> ExtractionResult:
+    """Extract from a numbered-line span, splitting in half and retrying if the
+    model returns unparseable JSON (Graphify's invalid-JSON recovery). Bottoms
+    out at a single line to avoid unbounded recursion."""
+    numbered_text = "\n".join(numbered_lines)
+    prompt = _build_prompt_text(doc_id, numbered_text)
     raw = call_llm(prompt)
-    payload = _extract_json(raw)
-    return validate(doc.doc_id, payload)
+    try:
+        payload = _extract_json(raw)
+    except (ValueError, json.JSONDecodeError):
+        if len(numbered_lines) <= 1:
+            res = ExtractionResult(doc_id=doc_id)
+            res.dropped.append("json parse error on single line; skipped")
+            return res
+        mid = len(numbered_lines) // 2
+        left = _extract_span(doc_id, numbered_lines[:mid])
+        right = _extract_span(doc_id, numbered_lines[mid:])
+        left.nodes.extend(right.nodes)
+        left.edges.extend(right.edges)
+        left.dropped.extend(right.dropped)
+        return left
+    return validate(doc_id, payload)
+
+
+def extract(doc: Document) -> ExtractionResult:
+    numbered_lines = doc.numbered_text().splitlines()
+    return _extract_span(doc.doc_id, numbered_lines)

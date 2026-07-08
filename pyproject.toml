@@ -14,6 +14,9 @@ dependencies = [
     "trafilatura>=1.8",
 ]
 
+[project.optional-dependencies]
+redis = ["redis>=5.0"]
+
 [project.scripts]
 ame-kb = "ame_kb.cli:app"
 

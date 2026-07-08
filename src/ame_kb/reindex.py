@@ -1,7 +1,8 @@
-"""Rebuild kg_search_index from the current nodes/edges.
+"""Rebuild the search index from the current nodes/edges/chunks.
 
-Used by `ame-kb reindex` after enabling or rotating the embedding endpoint, so
-existing rows get (re)embedded without re-running extraction.
+Used by `ame-kb reindex` after enabling or rotating the embedding endpoint, or
+after switching SEARCH_BACKEND, so existing rows get (re)embedded/reindexed into
+the active backend without re-running extraction.
 """
 from __future__ import annotations
 
@@ -11,11 +12,11 @@ from sqlalchemy import select
 
 from .config import get_settings
 from .db import session_scope
-from .models import GraphEdge, GraphNode
-from .searchindex import EDGE, NODE, build_searchable_text, upsert_search_index
+from .models import DocChunk, GraphEdge, GraphNode
+from .searchindex import DOC_CHUNK, EDGE, NODE, build_searchable_text, upsert_search_index
 
 
-def reindex_all() -> Tuple[int, int]:
+def reindex_all() -> Tuple[int, int, int]:
     settings = get_settings()
     with session_scope() as session:
         nodes = (
@@ -35,6 +36,16 @@ def reindex_all() -> Tuple[int, int]:
                     GraphEdge.graph_no == settings.graph_no,
                     GraphEdge.graph_version == settings.graph_version,
                     GraphEdge.deleted == 0,
+                )
+            )
+            .scalars()
+            .all()
+        )
+        chunks = (
+            session.execute(
+                select(DocChunk).where(
+                    DocChunk.graph_no == settings.graph_no,
+                    DocChunk.graph_version == settings.graph_version,
                 )
             )
             .scalars()
@@ -62,6 +73,14 @@ def reindex_all() -> Tuple[int, int]:
                     ),
                 }
             )
+        for c in chunks:
+            entries.append(
+                {
+                    "object_type": DOC_CHUNK,
+                    "object_no": c.chunk_no,
+                    "searchable_text": c.content or "",
+                }
+            )
         upsert_search_index(session, entries)
 
-    return len(nodes), len(edges)
+    return len(nodes), len(edges), len(chunks)

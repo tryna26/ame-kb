@@ -69,6 +69,14 @@ def init_db() -> None:
     inserted = seed_schema()
     typer.echo(f"Seeded schema: {inserted} new type row(s).")
 
+    # When the Redis backend is active, create its FT index too.
+    if get_settings().search_backend.lower() == "redis":
+        typer.echo("Creating RediSearch index...")
+        from .searchbackend import get_index
+
+        get_index()._ensure_index()  # type: ignore[attr-defined]
+        typer.echo("  RediSearch index ready")
+
 
 @app.command("ingest")
 def ingest_cmd(
@@ -124,6 +132,63 @@ def ingest_cmd(
         )
     if skipped:
         typer.echo(f"\nSkipped {skipped} unchanged document(s).")
+
+
+@app.command("ingest-url")
+def ingest_url_cmd(
+    url: str = typer.Option(None, help="A single URL to ingest."),
+    url_file: str = typer.Option(
+        None, help="Path to a newline-delimited URL manifest (# comments ok)."
+    ),
+    dry_run: bool = typer.Option(False, help="Fetch + extract and print, no DB."),
+    force: bool = typer.Option(
+        False, help="Re-extract even if content hash is unchanged."
+    ),
+) -> None:
+    """Fetch web page(s), extract entities+relations, and store them.
+
+    origin_url is recorded on kg_doc / kg_doc_chunk for provenance. Same
+    incremental hashing and store path as file ingestion.
+    """
+    urls = []
+    if url:
+        urls.append(url)
+    if url_file:
+        urls.extend(ingest_mod.read_url_list(url_file))
+    if not urls:
+        typer.echo("Provide --url or --url-file.")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Ingesting {len(urls)} URL(s)")
+    skipped = 0
+    for u in urls:
+        typer.echo(f"\n== {u} ==")
+        try:
+            doc = ingest_mod.load_url(u)
+        except Exception as exc:  # noqa: BLE001 - one bad URL shouldn't abort all
+            typer.echo(f"  fetch failed: {exc}")
+            continue
+        if not dry_run and not force and is_unchanged(doc):
+            skipped += 1
+            typer.echo("  (unchanged, skipped)")
+            continue
+        result = extract(doc)
+        typer.echo(
+            f"  extracted: {len(result.nodes)} node(s), {len(result.edges)} edge(s)"
+        )
+        for d in result.dropped:
+            typer.echo(f"  dropped: {d}")
+        if dry_run:
+            continue
+        stats = store(result)
+        ingest_mod.persist_doc(doc)
+        typer.echo(
+            "  stored: "
+            f"nodes +{stats.nodes_new}/~{stats.nodes_updated}, "
+            f"edges +{stats.edges_new}/~{stats.edges_updated}"
+        )
+    if skipped:
+        typer.echo(f"\nSkipped {skipped} unchanged URL(s).")
 
 
 @app.command("query")
@@ -186,13 +251,27 @@ def search_cmd(
     for ev in res.evidence:
         typer.echo(f"  {ev.doc_no}:{ev.line_no}  {ev.content}")
 
+    typer.echo(f"\n# Doc chunks ({len(res.doc_chunks)})")
+    for c in res.doc_chunks:
+        src = c.origin_url or c.file_path or c.doc_no
+        snippet = (c.content or "").replace("\n", " ")
+        if len(snippet) > 160:
+            snippet = snippet[:160] + "…"
+        typer.echo(
+            f"  {c.doc_no}#{c.chunk_index} (L{c.line_start}-{c.line_end}) {src}\n"
+            f"      {snippet}"
+        )
+
 
 @app.command("reindex")
 def reindex_cmd() -> None:
-    """Rebuild kg_search_index (searchable_text + embedding) from current
-    nodes/edges. Useful after enabling/rotating the embedding endpoint."""
-    n_nodes, n_edges = reindex_all()
-    typer.echo(f"Reindexed {n_nodes} node(s) and {n_edges} edge(s).")
+    """Rebuild the search index (searchable_text + embedding) from current
+    nodes/edges/chunks into the active backend. Useful after enabling/rotating
+    the embedding endpoint or switching SEARCH_BACKEND."""
+    n_nodes, n_edges, n_chunks = reindex_all()
+    typer.echo(
+        f"Reindexed {n_nodes} node(s), {n_edges} edge(s), {n_chunks} chunk(s)."
+    )
 
 
 @app.command("node-no")
