@@ -23,6 +23,7 @@ from .db import session_scope
 from .extract import ExtractionResult
 from .ingest import Document
 from .models import Doc, GraphEdge, GraphNode
+from .schema import register_type
 from .searchindex import EDGE, NODE, build_searchable_text, upsert_search_index
 
 
@@ -75,16 +76,37 @@ def _merge_ref(existing: Dict, doc_id: str, lines: List[str]) -> Dict:
     return ref
 
 
+def merge_ref_maps(a: Dict, b: Dict) -> Dict:
+    """Union two ref maps ({doc_id: [line, ...]}) doc by doc. Used by V5 fusion
+    to fold a merged-away node's provenance into the survivor."""
+    out = dict(a or {})
+    for doc_id, lines in (b or {}).items():
+        out[doc_id] = sorted(set(out.get(doc_id, [])) | set(lines or []))
+    return out
+
+
+def merge_props(winner: Dict, loser: Dict) -> Dict:
+    """Field-union of two property maps: winner wins on conflict, loser fills
+    keys the winner is missing (V5 fusion)."""
+    out = dict(loser or {})
+    out.update(winner or {})
+    return out
+
+
 def store(result: ExtractionResult) -> StoreStats:
     settings = get_settings()
     stats = StoreStats()
+    # V5: register any LLM-proposed new node types before persisting (only when
+    # SCHEMA_DYNAMIC is on; validate() leaves pending_node_types empty otherwise).
+    if result.pending_node_types:
+        for t in sorted(result.pending_node_types):
+            register_type("Node", t, description="(dynamic) LLM-proposed type")
     with session_scope() as session:
         name_to_no: Dict[str, str] = {}
         index_entries: List[Dict] = []
 
         for node in result.nodes:
             nno = node_no(node.type, node.name)
-            name_to_no[node.name] = nno
             existing = session.execute(
                 select(GraphNode).where(
                     GraphNode.graph_no == settings.graph_no,
@@ -92,6 +114,14 @@ def store(result: ExtractionResult) -> StoreStats:
                     GraphNode.graph_node_no == nno,
                 )
             ).scalar_one_or_none()
+            # A node_no merged away (soft-deleted) still owns the unique key, so
+            # we can't INSERT a fresh row for it; re-ingesting must NOT resurrect
+            # it in the search index. Skip it (and leave it out of name_to_no so
+            # edges pointing at the dead node are dropped too). Its mentions stay
+            # reachable via the survivor's alias-augmented searchable_text.
+            if existing is not None and existing.deleted:
+                continue
+            name_to_no[node.name] = nno
             if existing is None:
                 merged_props = node.properties or {}
                 description = node.description or None

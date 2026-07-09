@@ -4,7 +4,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BigInteger, DateTime, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.mysql import JSON, LONGTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -15,9 +23,14 @@ class Base(DeclarativeBase):
 
 class DomainEntity(Base):
     __tablename__ = "kg_domain_entity"
+    __table_args__ = (
+        UniqueConstraint(
+            "graph_no", "graph_version", "entity_name", name="uk_entity_name"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    entity_name: Mapped[str] = mapped_column(String(255), default="", unique=True)
+    entity_name: Mapped[str] = mapped_column(String(255), default="")
     cn_name: Mapped[str] = mapped_column(String(255), default="")
     entity_type: Mapped[str] = mapped_column(String(64), default="")
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -134,6 +147,35 @@ class DocLine(Base):
     doc_no: Mapped[str] = mapped_column(String(512))
     line_no: Mapped[int] = mapped_column(Integer)
     content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class EntityAlias(Base):
+    __tablename__ = "kg_entity_alias"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    graph_no: Mapped[str] = mapped_column(String(128), default="default")
+    graph_version: Mapped[int] = mapped_column(BigInteger, default=1)
+    canonical_node_no: Mapped[str] = mapped_column(String(191))
+    alias: Mapped[str] = mapped_column(String(255))
+    source: Mapped[str] = mapped_column(String(64), default="merge")
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class MergeLog(Base):
+    __tablename__ = "kg_merge_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    graph_no: Mapped[str] = mapped_column(String(128), default="default")
+    graph_version: Mapped[int] = mapped_column(BigInteger, default=1)
+    merge_id: Mapped[str] = mapped_column(String(64))
+    winner_node_no: Mapped[str] = mapped_column(String(191))
+    loser_node_no: Mapped[str] = mapped_column(String(191))
+    snapshot: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="MERGED")
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
 
 
 class SearchIndex(Base):

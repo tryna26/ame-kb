@@ -13,7 +13,14 @@ from sqlalchemy import select
 from .config import get_settings
 from .db import session_scope
 from .models import DocChunk, GraphEdge, GraphNode
-from .searchindex import DOC_CHUNK, EDGE, NODE, build_searchable_text, upsert_search_index
+from .searchindex import (
+    DOC_CHUNK,
+    EDGE,
+    NODE,
+    aliases_for,
+    build_searchable_text,
+    upsert_search_index,
+)
 
 
 def reindex_all() -> Tuple[int, int, int]:
@@ -52,6 +59,7 @@ def reindex_all() -> Tuple[int, int, int]:
             .all()
         )
 
+        alias_map = aliases_for(session, [n.graph_node_no for n in nodes])
         entries: List[Dict] = []
         for n in nodes:
             entries.append(
@@ -59,7 +67,10 @@ def reindex_all() -> Tuple[int, int, int]:
                     "object_type": NODE,
                     "object_no": n.graph_node_no,
                     "searchable_text": build_searchable_text(
-                        n.name, n.description, n.properties or {}
+                        n.name,
+                        n.description,
+                        n.properties or {},
+                        alias_map.get(n.graph_node_no),
                     ),
                 }
             )

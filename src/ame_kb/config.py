@@ -38,6 +38,10 @@ class Settings(BaseModel):
     recall_min_results: int
     retry_strict_text: float
     retry_strict_embedding: float
+    # V5: entity fusion (resolve) + semi-dynamic schema knobs.
+    resolve_candidate_topk: int
+    resolve_min_score_embedding: float
+    schema_dynamic: bool
 
 
 def _require(name: str) -> str:
@@ -78,4 +82,10 @@ def get_settings() -> Settings:
         recall_min_results=int(os.getenv("RECALL_MIN_RESULTS", "0")),
         retry_strict_text=float(os.getenv("RETRY_STRICT_TEXT", "0.8")),
         retry_strict_embedding=float(os.getenv("RETRY_STRICT_EMBEDDING", "0.8")),
+        resolve_candidate_topk=int(os.getenv("RESOLVE_CANDIDATE_TOPK", "10")),
+        resolve_min_score_embedding=float(
+            os.getenv("RESOLVE_MIN_SCORE_EMBEDDING", "0")
+        ),
+        schema_dynamic=os.getenv("SCHEMA_DYNAMIC", "false").lower()
+        in ("1", "true", "yes"),
     )

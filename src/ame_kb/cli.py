@@ -14,6 +14,7 @@ from .extract import extract
 from .query import find_entities, relations_of
 from .recall import recall
 from .reindex import reindex_all
+from .resolve import alias_of, resolve_all, rollback
 from .schema import seed_schema
 from .store import is_unchanged, node_no, store
 
@@ -22,11 +23,14 @@ app = typer.Typer(add_completion=False, help="Minimal knowledge-graph builder (V
 _SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
 
 # Idempotency: init-db reapplies DDL, so tolerate "already exists" style errors
-# from ALTER/CREATE when a column/table is already present.
+# from ALTER/CREATE when a column/table is already present, and "can't drop"
+# when an index a migration re-scopes was already dropped/renamed.
 _IDEMPOTENT_ERRORS = (
     "duplicate column name",
     "already exists",
     "duplicate key name",
+    "check that column/key exists",
+    "can't drop",
 )
 
 
@@ -278,6 +282,56 @@ def reindex_cmd() -> None:
 def node_no_cmd(type_: str = typer.Argument(...), name: str = typer.Argument(...)) -> None:
     """Print the business key (graph_node_no) for a type/name pair."""
     typer.echo(node_no(type_, name))
+
+
+@app.command("resolve")
+def resolve_cmd(
+    type_: str = typer.Option(
+        None, "--type", help="Only resolve nodes of this type."
+    ),
+    limit: int = typer.Option(
+        None, help="Candidate top-K per node (default RESOLVE_CANDIDATE_TOPK)."
+    ),
+    dry_run: bool = typer.Option(
+        False, help="Judge and print, do not merge or write."
+    ),
+) -> None:
+    """Cross-document entity fusion: find duplicate nodes (vector/full-text KNN),
+    LLM-judge same/related/different, and merge duplicates into a canonical
+    survivor. Merges record an alias + a rollback-able audit row."""
+    stats = resolve_all(type_filter=type_, dry_run=dry_run, limit=limit)
+    for j in stats.judgments:
+        typer.echo(f"  {j}")
+    verb = "would merge" if dry_run else "merged"
+    typer.echo(
+        f"\nScanned {stats.scanned} node(s); {verb} {stats.merged}, "
+        f"skipped {stats.skipped} non-duplicate pair(s)."
+    )
+
+
+@app.command("rollback-merge")
+def rollback_merge_cmd(merge_id: str = typer.Argument(..., help="merge_id to undo.")) -> None:
+    """Undo a merge from its snapshot (restore both nodes, un-remap edges, drop
+    the added aliases)."""
+    try:
+        rollback(merge_id)
+    except ValueError as exc:
+        typer.echo(f"Cannot rollback: {exc}")
+        raise typer.Exit(code=1)
+    typer.echo(f"Rolled back merge {merge_id}.")
+
+
+@app.command("alias-of")
+def alias_of_cmd(
+    entity: str = typer.Argument(..., help="Canonical node_no or exact name.")
+) -> None:
+    """List the aliases that resolve to a canonical entity."""
+    aliases = alias_of(entity)
+    if not aliases:
+        typer.echo(f"No aliases for '{entity}'.")
+        raise typer.Exit(code=0)
+    for a in aliases:
+        typer.echo(f"  {a}")
 
 
 if __name__ == "__main__":
