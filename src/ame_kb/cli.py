@@ -43,6 +43,23 @@ def _main(
     """
     graphs_mod.apply_graph_context(graph_no, graph_version)
 
+
+@app.callback()
+def _main(
+    graph_no: str = typer.Option(
+        None, "--graph-no", help="Target graph (system-generated graph_<id>)."
+    ),
+    graph_version: int = typer.Option(
+        None, "--graph-version", help="Pin a specific version (default: latest)."
+    ),
+) -> None:
+    """Inject the graph context (graph_no + resolved version) for every command.
+
+    Fault tolerant: on a fresh DB (no kg_graph yet) the version lookup is
+    skipped/swallowed so init-db can create the tables it depends on.
+    """
+    graphs_mod.apply_graph_context(graph_no, graph_version)
+
 _SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
 
 # Idempotency: init-db reapplies DDL, so tolerate "already exists" style errors
