@@ -21,7 +21,10 @@ from .resolve import alias_of, resolve_all, rollback
 from .schema import seed_schema
 from .store import is_unchanged, node_no, store
 
-app = typer.Typer(add_completion=False, help="Minimal knowledge-graph builder (V3).")
+app = typer.Typer(
+    add_completion=False,
+    help="Versioned knowledge-recall and agent-memory core (V6.1).",
+)
 
 
 @app.callback()

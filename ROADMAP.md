@@ -41,8 +41,8 @@
 | V2 | 多源接入（pdf/html）+ 半动态属性 + hash 增量 + 边置信 | ✅ 已交付 |
 | V3 | 全混合召回：FULLTEXT(ngram) + 向量 cosine + RRF + 10 步召回 + Ref 取原文 | ✅ 已交付 |
 | V4 | 可切换搜索后端 + doc chunk + 多 query + 多跳 + 重试阶梯 + URL 接入 | ✅ 已交付 |
-| V5 | 实体对齐与融合 + 动态 schema | 🔴 计划 |
-| V6 | 规模化 pipeline + Agent 接口(REST/MCP) + UI | 🔴 计划 |
+| V5 | 实体对齐与融合 + 半动态 schema | ✅ 核心已交付（代码源后移） |
+| V6 | 版本化 + 规模化 pipeline + Agent 接口(REST/MCP) + UI | 🟡 V6.1 已交付 |
 | V7 | 高级能力（多租户 / schema 演化 / 图算法 / 图库迁移） | 🔴 可选 |
 
 ---
@@ -161,7 +161,7 @@ RETRY_STRICT_TEXT/EMBEDDING=0.8 # 阶梯首档阈值
 
 ---
 
-## V5 — 实体对齐与融合 + 动态 schema 🔴
+## V5 — 实体对齐与融合 + 半动态 schema ✅（核心验收已完成）
 
 **目标**：从"抽出一堆点"变成"稳定的知识实体"。向量在这里从"搜索入口"升级为"实体治理基建"。
 
@@ -169,7 +169,7 @@ RETRY_STRICT_TEXT/EMBEDDING=0.8 # 阶梯首档阈值
 
 ```
 Resolution:
-- normalized_name 精确查重（V3 slug 升级）
+- normalized_name 精确查重（V3 slug 升级，后续增强）
 - alias 匹配
 - HybridIndex 向量召回候选（复用 V4 后端，无需新组件）
 - LLM 判定 same / related / different
@@ -177,9 +177,9 @@ Resolution:
 - 边重新挂到 canonical entity
 
 Schema:
-- 固定 schema -> 半动态 -> 动态；core fields 稳定，properties 承接长尾
-- schema 字段归一化
-- 代码源 tree-sitter（Function/Class/Module 节点，EXTRACTED 边）
+- 固定 schema -> 半动态；core fields 稳定，properties 承接长尾
+- schema 字段归一化（后续增强）
+- 代码源 tree-sitter（Function/Class/Module 节点，EXTRACTED 边，后续增强）
 ```
 
 ### 实体融合流程
@@ -215,16 +215,29 @@ new_entity:
 
 ### V5 验收标准
 
-1. 同一实体跨多文档出现不重复成多个主实体
-2. 字段能融合，别名能搜到主实体
-3. 合并错误可回滚
-4. schema 从固定平滑过渡到半/动态，core fields 不漂
+1. ✅ 同一实体跨多文档出现不重复成多个主实体
+2. ✅ 字段能融合，别名能搜到主实体
+3. ✅ 合并错误可回滚
+4. ✅ schema 从固定平滑过渡到半动态，core fields 不漂
+
+> `normalized_name` 独立字段、schema 字段归一化和代码源 tree-sitter 尚未实现，作为后续独立增强项，不阻塞上述 V5 核心验收。
 
 ---
 
-## V6 — 规模化 Pipeline + Agent 接口 + UI 🔴
+## V6 — 版本化 + 规模化 Pipeline + Agent 接口 + UI 🟡
 
 **目标**：从单机脚本变成可长期运行的知识服务，Agent 真正能调用这套记忆层。
+
+### V6.1 — 多图谱版本化基础 ✅
+
+- `kg_graph` 管理 `BUILDING / ACTIVE / FROZEN` 生命周期，默认查询只解析最新 `ACTIVE` 版本。
+- `kg_graph_file` 保存跨版本文件清单；新增、删除、修改文件后自动派生 `vN+1`。
+- 未变文档投影节点、边、Ref、原文、chunk、schema、alias 和搜索索引；只对变化/新增文档调用 LLM。
+- MySQL / Redis 搜索后端均按 `graph_no + graph_version` 隔离，并原样复制已有 embedding。
+- 中断留下的 `BUILDING` 版本可续跑；无变化默认不制造空版本。
+- 图谱选择改为请求/任务级 `GraphContext`，为并发 REST/MCP 和 worker 消除进程环境变量竞争。
+
+下一阶段为 V6.2：任务表、异步 worker、逐文档 checkpoint、进度观测和失败重试。
 
 ### 功能范围
 
@@ -278,7 +291,6 @@ UI:
 | 条目 | 借鉴 |
 |---|---|
 | schema 自动演化 | `general_recall/core/entity/sync_spec.go`（spec 注册机制） |
-| 多图版本继承 | 本项目 `graph_no / graph_version`（已有种子字段） |
 | 权限隔离 / 多租户 | `workspace_id`（V4 已建 dormant 字段）；`sources.md:32` workspace_ids |
 | 社区发现 / 图算法 | 外部 networkx / Neo4j GDS |
 | 图数据库迁移 | 外部 Neo4j，**仅在 MySQL 边表频繁复杂路径 / 深层遍历明显卡顿时才考虑，非默认** |

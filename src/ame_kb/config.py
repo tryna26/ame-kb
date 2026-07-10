@@ -1,8 +1,18 @@
-"""Runtime configuration loaded from environment (.env)."""
+"""Runtime configuration loaded from environment (.env).
+
+Graph selection is request/task-local. The environment supplies the default
+graph, while :func:`graph_context` overlays ``graph_no`` / ``graph_version``
+through ``contextvars``. This keeps existing ``get_settings()`` call sites
+working without letting concurrent requests mutate process-wide graph state.
+"""
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from functools import lru_cache
+from typing import Iterator, Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -44,6 +54,49 @@ class Settings(BaseModel):
     schema_dynamic: bool
 
 
+@dataclass(frozen=True)
+class GraphContext:
+    """Request/task-local graph selection."""
+
+    graph_no: str
+    graph_version: int
+
+
+_graph_context: ContextVar[Optional[GraphContext]] = ContextVar(
+    "ame_kb_graph_context", default=None
+)
+
+
+def set_graph_context(graph_no: str, graph_version: int) -> Token:
+    """Select a graph for the current context and return a reset token."""
+
+    return _graph_context.set(GraphContext(graph_no, graph_version))
+
+
+def reset_graph_context(token: Token) -> None:
+    """Restore the graph context that preceded ``set_graph_context``."""
+
+    _graph_context.reset(token)
+
+
+def clear_graph_context() -> None:
+    """Return the current context to the environment-configured default."""
+
+    _graph_context.set(None)
+
+
+@contextmanager
+def graph_context(graph_no: str, graph_version: int) -> Iterator[GraphContext]:
+    """Temporarily select a graph, isolated from concurrent async tasks."""
+
+    selected = GraphContext(graph_no, graph_version)
+    token = _graph_context.set(selected)
+    try:
+        yield selected
+    finally:
+        _graph_context.reset(token)
+
+
 def _require(name: str) -> str:
     val = os.getenv(name)
     if not val:
@@ -54,7 +107,7 @@ def _require(name: str) -> str:
 
 
 @lru_cache(maxsize=1)
-def get_settings() -> Settings:
+def _base_settings() -> Settings:
     return Settings(
         llm_api_key=_require("LLM_API_KEY"),
         llm_base_url=_require("LLM_BASE_URL"),
@@ -89,3 +142,29 @@ def get_settings() -> Settings:
         schema_dynamic=os.getenv("SCHEMA_DYNAMIC", "false").lower()
         in ("1", "true", "yes"),
     )
+
+
+def get_settings() -> Settings:
+    """Return base settings overlaid with the current graph context, if any."""
+
+    settings = _base_settings()
+    selected = _graph_context.get()
+    if selected is None:
+        return settings
+    return settings.model_copy(
+        update={
+            "graph_no": selected.graph_no,
+            "graph_version": selected.graph_version,
+        }
+    )
+
+
+def get_default_settings() -> Settings:
+    """Return environment-backed settings without a graph-context overlay."""
+
+    return _base_settings()
+
+
+# Preserve the cache hook used by existing tests/callers that update env-based
+# settings. Graph-context changes themselves do not need a cache clear.
+get_settings.cache_clear = _base_settings.cache_clear  # type: ignore[attr-defined]

@@ -21,7 +21,6 @@ nothing is re-embedded on either backend.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -31,7 +30,7 @@ from sqlalchemy.orm import Session
 from . import extract as extract_mod
 from . import ingest as ingest_mod
 from . import store as store_mod
-from .config import get_settings
+from .config import graph_context
 from .db import session_scope
 from .manifest import ManifestFile
 from .models import (
@@ -400,12 +399,6 @@ def _has_docs(session: Session, graph_no: str, version: int) -> bool:
     )
 
 
-def _set_version(graph_no: str, version: int) -> None:
-    os.environ["GRAPH_NO"] = graph_no
-    os.environ["GRAPH_VERSION"] = str(version)
-    get_settings.cache_clear()
-
-
 def _resolve_versions(session: Session, graph_no: str) -> Tuple[Optional[int], int, bool]:
     """Return (base_version, target_version, is_resume).
 
@@ -509,17 +502,17 @@ def build_next_version(
                 result.projected_edges = pe
 
     # Extract changed + new files into the target version.
-    _set_version(graph_no, target_v)
-    for doc_no in cls.to_extract:
-        doc = docs.get(doc_no)
-        if doc is None:
-            continue
-        if not force and store_mod.is_unchanged(doc):
-            continue  # already persisted by an interrupted run (resume)
-        ext = extract_mod.extract(doc)
-        store_mod.store(ext)
-        ingest_mod.persist_doc(doc)
-        result.extracted_docs += 1
+    with graph_context(graph_no, target_v):
+        for doc_no in cls.to_extract:
+            doc = docs.get(doc_no)
+            if doc is None:
+                continue
+            if not force and store_mod.is_unchanged(doc):
+                continue  # already persisted by an interrupted run (resume)
+            ext = extract_mod.extract(doc)
+            store_mod.store(ext)
+            ingest_mod.persist_doc(doc)
+            result.extracted_docs += 1
 
     # Finalize: target ACTIVE, base FROZEN.
     with session_scope() as session:

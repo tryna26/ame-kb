@@ -3,11 +3,15 @@ fallback), file-manifest doc_no normalization, classify bucketing, the version
 projection (_project) copy semantics, and the end-to-end build_next_version
 orchestration (LLM stubbed, in-memory SQLite). No real DB/LLM/embedding calls.
 """
+import asyncio
+import os
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select
 
+from ame_kb.config import clear_graph_context, get_settings, graph_context
 import ame_kb.graphs as graphs_mod
 import ame_kb.manifest as manifest_mod
 import ame_kb.versioning as versioning_mod
@@ -24,6 +28,15 @@ from ame_kb.models import (
 )
 from ame_kb.searchindex import DOC_CHUNK, EDGE, NODE
 from ame_kb.versioning import Classification, classify
+
+
+@pytest.fixture(autouse=True)
+def _reset_graph_context():
+    """Graph selection must never leak between tests (or future requests)."""
+
+    clear_graph_context()
+    yield
+    clear_graph_context()
 
 
 # ---- classify bucketing (pure) ----
@@ -68,24 +81,18 @@ def test_doc_no_outside_root_falls_back_to_abs(tmp_path):
 # ---- version resolution is fault tolerant on a fresh DB (fix #1) ----
 
 def test_apply_graph_context_fresh_db_no_crash(monkeypatch):
-    # kg_graph missing -> latest lookup raises -> must swallow and not set version.
+    # kg_graph missing -> latest lookup raises -> fall back to configured version.
     def _boom():
         raise RuntimeError("no such table: kg_graph")
 
     monkeypatch.setattr(graphs_mod, "session_scope", _boom)
-    cleared = {"n": 0}
-    monkeypatch.setattr(
-        graphs_mod.get_settings, "cache_clear", lambda: cleared.__setitem__("n", cleared["n"] + 1)
-    )
     monkeypatch.delenv("GRAPH_VERSION", raising=False)
-    monkeypatch.setenv("GRAPH_NO", "graph_abc")
+    get_settings.cache_clear()
     # Named graph, no explicit version -> would look up latest, but DB is down.
     graphs_mod.apply_graph_context("graph_abc", None)
-    assert cleared["n"] == 1  # settings still refreshed
-    # No version was forced (swallowed), so env stays unset.
-    import os
-
-    assert os.environ.get("GRAPH_VERSION") is None
+    selected = get_settings()
+    assert selected.graph_no == "graph_abc"
+    assert selected.graph_version == 1
 
 
 def test_apply_graph_context_default_skips_lookup(monkeypatch):
@@ -96,10 +103,55 @@ def test_apply_graph_context_default_skips_lookup(monkeypatch):
         raise AssertionError("default graph must not query kg_graph")
 
     monkeypatch.setattr(graphs_mod, "_latest_version_safe", _tracker)
-    monkeypatch.setattr(graphs_mod.get_settings, "cache_clear", lambda: None)
     monkeypatch.delenv("GRAPH_NO", raising=False)
+    get_settings.cache_clear()
     graphs_mod.apply_graph_context(None, None)  # default graph, no version
     assert called["n"] == 0
+
+
+def test_latest_version_ignores_building(monkeypatch):
+    Session = _sqlite_session_factory()
+    with Session() as s:
+        s.add_all([
+            Graph(graph_no="g1", graph_version=1, name="G1", status="ACTIVE"),
+            Graph(graph_no="g1", graph_version=2, name="G1", status="BUILDING"),
+        ])
+        s.commit()
+
+    monkeypatch.setattr(graphs_mod, "session_scope", _scope_factory(Session))
+    assert graphs_mod.latest_version("g1") == 1
+    graphs_mod.apply_graph_context("g1", None)
+    assert get_settings().graph_version == 1
+
+
+def test_graph_context_isolated_between_async_tasks():
+    async def _read(graph_no, version):
+        with graph_context(graph_no, version):
+            await asyncio.sleep(0)
+            settings = get_settings()
+            return settings.graph_no, settings.graph_version
+
+    async def _run():
+        return await asyncio.gather(_read("g1", 1), _read("g2", 7))
+
+    assert asyncio.run(_run()) == [("g1", 1), ("g2", 7)]
+
+
+def test_apply_graph_context_does_not_mutate_environment(monkeypatch):
+    monkeypatch.setenv("GRAPH_NO", "env_graph")
+    monkeypatch.setenv("GRAPH_VERSION", "3")
+    get_settings.cache_clear()
+
+    graphs_mod.apply_graph_context("request_graph", 9)
+
+    assert (os.environ["GRAPH_NO"], os.environ["GRAPH_VERSION"]) == (
+        "env_graph",
+        "3",
+    )
+    assert (get_settings().graph_no, get_settings().graph_version) == (
+        "request_graph",
+        9,
+    )
 
 
 # ---- _project + build_next_version against in-memory SQLite ----
@@ -243,6 +295,41 @@ def test_project_shares_and_drops(monkeypatch):
             EntityAlias.graph_version == 2)).scalar_one().alias == "共享"
 
 
+def test_redis_copy_version_rekeys_and_preserves_embedding(monkeypatch):
+    """Redis projection must not mutate v1 or recompute its embedding bytes."""
+
+    from ame_kb.searchbackend.redis import RedisHybridIndex
+
+    class _FakeRedis:
+        def __init__(self):
+            self.hashes = {}
+
+        def hgetall(self, key):
+            return dict(self.hashes.get(key, {}))
+
+        def hset(self, key, mapping):
+            self.hashes[key] = dict(mapping)
+
+    idx = RedisHybridIndex()
+    client = _FakeRedis()
+    src = idx._doc_key("g1", 1, NODE, "N:shared")
+    dst = idx._doc_key("g1", 2, NODE, "N:shared")
+    embedding = b"\x00\x01vector-bytes"
+    client.hashes[src] = {
+        b"graph_no": b"g1",
+        b"graph_version": b"1",
+        b"object_type": NODE.encode(),
+        b"object_no": b"N:shared",
+        b"embedding": embedding,
+    }
+    monkeypatch.setattr(idx, "_redis", lambda: client)
+
+    assert idx.copy_version("g1", NODE, ["N:shared", "N:missing"], 1, 2) == 1
+    assert client.hashes[src][b"graph_version"] == b"1"
+    assert client.hashes[dst][b"graph_version"] == b"2"
+    assert client.hashes[dst][b"embedding"] == embedding
+
+
 def _stub_extract(monkeypatch, calls):
     """extract() records which doc_ids it was asked to process; store/persist
     become no-ops so we test orchestration, not persistence."""
@@ -279,8 +366,6 @@ def test_build_only_extracts_changed_and_new(monkeypatch, tmp_path):
                         lambda text: "h_" + text.strip())
     calls = []
     _stub_extract(monkeypatch, calls)
-    # after set_version, extraction path also calls these module funcs:
-    monkeypatch.setattr(versioning_mod, "_set_version", lambda g, v: None)
 
     files = [
         _mf("d1", "d1.md", "d1", tmp_path),   # hash h_d1 == stored -> unchanged
@@ -302,10 +387,8 @@ def test_build_skips_when_no_changes(monkeypatch, tmp_path):
     Session = _sqlite_session_factory()
     _seed_v1(Session)
     monkeypatch.setattr(versioning_mod, "session_scope", _scope_factory(Session))
-    monkeypatch.setattr(versioning_mod, "get_settings", lambda: _Settings())
     monkeypatch.setattr(versioning_mod.store_mod, "content_hash",
                         lambda text: "h_" + text.strip())
-    monkeypatch.setattr(versioning_mod, "_set_version", lambda g, v: None)
     calls = []
     _stub_extract(monkeypatch, calls)
 

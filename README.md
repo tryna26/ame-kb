@@ -1,14 +1,15 @@
 # ame-kb
 
-最小可用的知识图谱构建器（V2）：扫描本地多格式源 → LLM 抽取实体与关系 → 存入 MySQL → 按名查询与一跳关系。
+面向 AI Agent 的 Knowledge Recall / Memory 服务内核（当前 V6.1）：多源文档 → LLM 抽取实体与关系 → MySQL 图存储 → 全文/向量混合召回 → 多图谱版本化增量构建。
 
-V2 在 V1 闭环上新增：多源接入（md/txt/pdf/html）、半动态属性、内容 hash 增量、边置信标签。
+目前已交付 V1～V5，以及 V6.1 的图谱注册、文件清单、版本继承和安全的请求级图谱上下文。异步 Pipeline、REST/MCP 和 UI 仍在后续 V6 阶段。
 
-三表设计借鉴自 oceanai_site：
+核心表设计借鉴自 oceanai_site：
 - `kg_domain_entity`：类型定义层（schema），V1 由固定 schema 写入种子
 - `kg_graph_node`：实例节点
 - `kg_graph_edge`：实例边
 - `kg_doc_version`（V2）：文档内容 SHA-256 快照，用于增量跳过未变文档
+- `kg_graph` / `kg_graph_file`（V6.1）：图谱版本生命周期和跨版本文件清单
 
 ## 环境要求
 
@@ -35,8 +36,8 @@ LLM_MODEL=...                   # 模型名
 MYSQL_DSN=mysql+pymysql://user:pass@host:3306/kb?charset=utf8mb4
 SOURCE_DIR=./data               # 待扫描的文档目录
 
-GRAPH_NO=default                # 逻辑图谱标识（V1 固定）
-GRAPH_VERSION=1
+GRAPH_NO=default                # 默认图谱；CLI --graph-no 可按请求覆盖
+GRAPH_VERSION=1                # 默认版本；托管图谱不指定时只解析最新 ACTIVE 版本
 ```
 
 `.env` 已在 `.gitignore` 中，不会被提交。
@@ -79,6 +80,26 @@ python3 -m ame_kb.cli alias-of "Ada Lovelace"
 python3 -m ame_kb.cli node-no Person "Ada Lovelace"
 ```
 
+### 多图谱版本化工作流（V6.1）
+
+```bash
+# 注册托管图谱，记录输出的 graph_no（例如 graph_a1b2c3d4）
+python3 -m ame_kb.cli create-graph --name "Agent Memory"
+
+# 维护该图谱的文件清单
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 add-file ./data
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 list-files
+
+# 首次填充 v1；后续运行自动派生 vN+1
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 ingest
+
+# 默认只查询最新 ACTIVE 版本；也可显式固定历史版本
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 search "Ada 做过什么？"
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 --graph-version 1 search "Ada 做过什么？"
+```
+
+派生新版本时，未变化文档的节点、边、原文和搜索索引会直接继承，embedding 不会重新计算；只有新增/变化文档调用 LLM。构建中的 `BUILDING` 版本不会成为默认查询版本，中断构建可在下一次 `ingest` 时续跑。图谱选择通过请求/任务级 `GraphContext` 隔离，不修改进程级环境变量。
+
 把你的 `.md` / `.txt` / `.pdf` / `.html` 文件放进 `SOURCE_DIR`（默认 `./data`）即可被扫描抽取。
 
 ## 抽取机制
@@ -116,10 +137,11 @@ python3 -m ame_kb.cli node-no Person "Ada Lovelace"
 python3 -m pytest tests/ -q
 ```
 
-离线测试（不连 DB/LLM）覆盖：schema 校验、半动态属性保留、node_no 去重、JSON 解析容错、源分发、内容 hash、边置信默认值与校验。V5 追加：字段并集/ref 并集 helper、别名进索引、动态 schema DB→种子回退与新类型 pending 判定、判同 JSON 解析容错，以及在内存 SQLite 上跑真实的 merge/边重挂去重/rollback 全链路。
+离线测试（不连 DB/LLM）覆盖：schema 校验、半动态属性保留、node_no 去重、JSON 解析容错、源分发、内容 hash、边置信默认值与校验。V5 追加实体融合/回滚全链路；V6.1 追加 ACTIVE 版本隔离、异步 GraphContext 隔离、增量版本投影，以及 MySQL/Redis 索引跨版本复制和 embedding 保留。
 
 ## 后续版本（规划）
 
 - ~~V5：跨文档实体去重与融合（向量召回 + LLM 判同）+ 别名可回滚 + 半动态 schema~~（已完成）
-- V6：规模化异步 pipeline（Redis 任务队列 / checkpoint 增量续跑）+ REST/MCP server（给 AI agent 当记忆层）+ 图可视化 UI
-- V7（可选）：schema 自动演化、多图版本继承、多租户权限隔离、图数据库迁移（Neo4j）、社区发现
+- V6.1：多图谱版本化增量构建 + ACTIVE 版本隔离 + 请求级 GraphContext（已完成）
+- V6.2～V6.4：规模化异步 pipeline（Redis 任务队列 / checkpoint）+ REST/MCP server + 图可视化 UI
+- V7（可选）：schema 自动演化、多租户权限隔离、图数据库迁移（Neo4j）、社区发现
