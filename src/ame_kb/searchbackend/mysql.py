@@ -225,3 +225,60 @@ class MysqlHybridIndex(HybridIndex):
             )
         res = session.execute(sa_delete(SearchIndex).where(*conds))
         return res.rowcount or 0
+
+    def copy_version(
+        self,
+        graph_no: str,
+        object_type: str,
+        object_nos: Sequence[str],
+        from_version: int,
+        to_version: int,
+        *,
+        session=None,
+    ) -> int:
+        object_nos = list(object_nos)
+        if not object_nos:
+            return 0
+        if session is None:
+            with session_scope() as own:
+                return self._copy_version(
+                    graph_no, object_type, object_nos, from_version, to_version, own
+                )
+        return self._copy_version(
+            graph_no, object_type, object_nos, from_version, to_version, session
+        )
+
+    def _copy_version(
+        self,
+        graph_no: str,
+        object_type: str,
+        object_nos: List[str],
+        from_version: int,
+        to_version: int,
+        session: Session,
+    ) -> int:
+        rows = (
+            session.execute(
+                select(SearchIndex).where(
+                    SearchIndex.graph_no == graph_no,
+                    SearchIndex.graph_version == from_version,
+                    SearchIndex.object_type == object_type,
+                    SearchIndex.object_no.in_(object_nos),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for r in rows:
+            session.add(
+                SearchIndex(
+                    graph_no=graph_no,
+                    graph_version=to_version,
+                    object_type=r.object_type,
+                    object_no=r.object_no,
+                    searchable_text=r.searchable_text,
+                    embedding=r.embedding,
+                    workspace_id=r.workspace_id,
+                )
+            )
+        return len(rows)

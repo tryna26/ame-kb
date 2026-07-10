@@ -21,6 +21,42 @@ class Base(DeclarativeBase):
     pass
 
 
+class Graph(Base):
+    __tablename__ = "kg_graph"
+    __table_args__ = (
+        UniqueConstraint("graph_no", "graph_version", name="uk_graph_ver"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    graph_no: Mapped[str] = mapped_column(String(128))
+    graph_version: Mapped[int] = mapped_column(BigInteger, default=1)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(16), default="ACTIVE")
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class GraphFile(Base):
+    __tablename__ = "kg_graph_file"
+    __table_args__ = (
+        UniqueConstraint("graph_no", "doc_no", name="uk_graph_file"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    graph_no: Mapped[str] = mapped_column(String(128))
+    doc_no: Mapped[str] = mapped_column(String(512))
+    path: Mapped[str] = mapped_column(String(1024), default="")
+    source_type: Mapped[str] = mapped_column(String(32), default="")
+    origin_url: Mapped[str] = mapped_column(String(1024), default="")
+    deleted: Mapped[int] = mapped_column(Integer, default=0)
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class DomainEntity(Base):
     __tablename__ = "kg_domain_entity"
     __table_args__ = (
