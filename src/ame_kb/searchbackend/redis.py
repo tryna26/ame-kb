@@ -2,10 +2,15 @@
 client-side with the same rrf_merge as the MySQL backend (so SEARCH_BACKEND can
 be switched with structurally identical fusion).
 
-One FT index over hash docs keyed `{prefix}:{object_type}:{object_no}`:
+One FT index over hash docs keyed `{prefix}:{graph_no}:{graph_version}:{object_type}:{object_no}`:
   graph_no / graph_version / object_type / object_no / workspace_id  as TAG
   searchable_text                                                    as TEXT
   embedding                                                          as VECTOR
+
+Putting graph_no/graph_version in the key (not just the TAG fields) keeps
+versions isolated: v1 and v2 of the same object_no live under distinct keys, so
+an upsert of one never overwrites the other and a version-scoped delete cannot
+take the other version's row with it.
 
 CJK note: Redis Stack tokenizes Chinese via the Friso tokenizer when the query
 runs with LANGUAGE chinese; we pass that so full-text recall works on Chinese
@@ -57,8 +62,12 @@ class RedisHybridIndex(HybridIndex):
     def _index_name(self) -> str:
         return f"{self._prefix()}_idx"
 
-    def _doc_key(self, object_type: str, object_no: str) -> str:
-        return f"{self._prefix()}:{object_type}:{object_no}"
+    def _doc_key(
+        self, graph_no: str, graph_version, object_type: str, object_no: str
+    ) -> str:
+        return (
+            f"{self._prefix()}:{graph_no}:{graph_version}:{object_type}:{object_no}"
+        )
 
     def _resolve_dim(self) -> Optional[int]:
         if self._dim:
@@ -254,7 +263,15 @@ class RedisHybridIndex(HybridIndex):
             }
             if e.embedding is not None:
                 mapping["embedding"] = _vec_bytes(e.embedding)
-            pipe.hset(self._doc_key(e.object_type, e.object_no), mapping=mapping)
+            pipe.hset(
+                self._doc_key(
+                    settings.graph_no,
+                    settings.graph_version,
+                    e.object_type,
+                    e.object_no,
+                ),
+                mapping=mapping,
+            )
         pipe.execute()
         return len(entries)
 
@@ -264,10 +281,15 @@ class RedisHybridIndex(HybridIndex):
         object_nos = list(object_nos)
         if not object_nos:
             return 0
+        settings = get_settings()
         client = self._redis()
         pipe = client.pipeline(transaction=False)
         for no in object_nos:
-            pipe.delete(self._doc_key(object_type, no))
+            pipe.delete(
+                self._doc_key(
+                    settings.graph_no, settings.graph_version, object_type, no
+                )
+            )
         results = pipe.execute()
         return sum(int(bool(r)) for r in results)
 
@@ -280,22 +302,48 @@ class RedisHybridIndex(HybridIndex):
             return 0
         client = self._redis()
         deleted = 0
-        # Page through matches deleting their keys (delete-by-filter; one doc =
-        # many chunk rows, so there is no single id to delete by).
+        # Page through matches deleting each hit by its real key (doc.id). The FT
+        # query is graph-scoped via TAG filters, so this is version-safe; one doc
+        # maps to many chunk rows, so there is no single id to delete by.
         while True:
-            q = Query(base).return_fields("object_type", "object_no").paging(0, 200)
+            q = Query(base).no_content().paging(0, 200)
             res = client.ft(self._index_name()).search(q)
             if not res.docs:
                 break
             pipe = client.pipeline(transaction=False)
             for doc in res.docs:
-                pipe.delete(
-                    self._doc_key(_decode(doc.object_type), _decode(doc.object_no))
-                )
+                pipe.delete(doc.id)
             deleted += sum(int(bool(r)) for r in pipe.execute())
             if len(res.docs) < 200:
                 break
         return deleted
+
+    def copy_version(
+        self,
+        graph_no: str,
+        object_type: str,
+        object_nos: Sequence[str],
+        from_version: int,
+        to_version: int,
+        *,
+        session=None,
+    ) -> int:
+        object_nos = list(object_nos)
+        if not object_nos:
+            return 0
+        client = self._redis()
+        copied = 0
+        for no in object_nos:
+            src = self._doc_key(graph_no, from_version, object_type, no)
+            mapping = client.hgetall(src)
+            if not mapping:
+                continue
+            # Rewrite the version field (bytes hash), keep embedding bytes as-is.
+            mapping[b"graph_version"] = str(to_version).encode("utf-8")
+            dst = self._doc_key(graph_no, to_version, object_type, no)
+            client.hset(dst, mapping=mapping)
+            copied += 1
+        return copied
 
 
 def _decode(value) -> str:

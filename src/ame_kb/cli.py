@@ -8,6 +8,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from . import ingest as ingest_mod
+from . import graphs as graphs_mod
+from . import manifest as manifest_mod
+from . import versioning as versioning_mod
 from .config import get_settings
 from .db import get_engine, ping
 from .extract import extract
@@ -19,6 +22,23 @@ from .schema import seed_schema
 from .store import is_unchanged, node_no, store
 
 app = typer.Typer(add_completion=False, help="Minimal knowledge-graph builder (V3).")
+
+
+@app.callback()
+def _main(
+    graph_no: str = typer.Option(
+        None, "--graph-no", help="Target graph (system-generated graph_<id>)."
+    ),
+    graph_version: int = typer.Option(
+        None, "--graph-version", help="Pin a specific version (default: latest)."
+    ),
+) -> None:
+    """Inject the graph context (graph_no + resolved version) for every command.
+
+    Fault tolerant: on a fresh DB (no kg_graph yet) the version lookup is
+    skipped/swallowed so init-db can create the tables it depends on.
+    """
+    graphs_mod.apply_graph_context(graph_no, graph_version)
 
 _SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
 
@@ -89,14 +109,30 @@ def ingest_cmd(
     force: bool = typer.Option(
         False, help="Re-extract even if content hash is unchanged."
     ),
+    allow_empty: bool = typer.Option(
+        False, help="Build a new version even when nothing changed (managed graphs)."
+    ),
+    graph_version: int = typer.Option(
+        None, "--graph-version", help="(ignored for ingest; a new version is derived)."
+    ),
 ) -> None:
     """Scan sources, LLM-extract entities+relations, and store them.
 
-    Incremental: docs whose SHA-256 matches the last run (kg_doc.sha256) are
-    skipped (unless --force or --dry-run). --dry-run never touches the DB.
-    On store, doc + numbered lines + search index (with embedding) are written.
+    Managed graphs (registered via create-graph) ingest from their file manifest
+    and derive a new version vN+1: unchanged files inherit their knowledge, only
+    changed/new files hit the LLM. Legacy graphs (e.g. default) keep the V3
+    directory-scan behaviour unchanged.
     """
     settings = get_settings()
+    if graph_version is not None:
+        typer.echo(
+            "  warning: ingest always derives a new version; --graph-version ignored."
+        )
+
+    if graphs_mod.is_managed(settings.graph_no):
+        _ingest_managed(settings.graph_no, dry_run=dry_run, force=force, allow_empty=allow_empty)
+        return
+
     root = source_dir or settings.source_dir
     docs = ingest_mod.scan(root)
     if not docs:
@@ -136,6 +172,103 @@ def ingest_cmd(
         )
     if skipped:
         typer.echo(f"\nSkipped {skipped} unchanged document(s).")
+
+
+def _ingest_managed(
+    graph_no: str, *, dry_run: bool, force: bool, allow_empty: bool
+) -> None:
+    files = manifest_mod.list_files(graph_no)
+    if not files:
+        typer.echo(f"Manifest for {graph_no} is empty; add files with add-file.")
+        raise typer.Exit(code=0)
+    res = versioning_mod.build_next_version(
+        graph_no, files, force=force, allow_empty=allow_empty, dry_run=dry_run
+    )
+    for w in res.warnings:
+        typer.echo(f"  warning: {w}")
+    c = res.classification
+    typer.echo(
+        f"Base v{res.base_version if res.base_version else '-'} -> "
+        f"target v{res.target_version}"
+    )
+    typer.echo(
+        f"  classify: {len(c.unchanged)} unchanged, {len(c.changed)} changed, "
+        f"{len(c.new)} new, {len(c.removed)} removed"
+    )
+    if dry_run:
+        typer.echo("  (dry-run: no version built)")
+        return
+    if res.skipped:
+        typer.echo("  no changes; kept current version (use --allow-empty to force).")
+        return
+    typer.echo(
+        f"  projected: {res.projected_nodes} node(s), {res.projected_edges} edge(s); "
+        f"extracted {res.extracted_docs} doc(s)."
+    )
+    typer.echo(f"Built v{res.target_version} (ACTIVE).")
+
+
+@app.command("create-graph")
+def create_graph_cmd(
+    name: str = typer.Option(..., "--name", help="Display name for the graph.")
+) -> None:
+    """Register a new versioned graph. Prints its system-generated graph_no."""
+    graph_no = graphs_mod.create_graph(name)
+    typer.echo(graph_no)
+
+
+@app.command("list-graphs")
+def list_graphs_cmd() -> None:
+    """List registered graphs and their latest version."""
+    graphs = graphs_mod.list_graphs()
+    if not graphs:
+        typer.echo("No registered graphs.")
+        raise typer.Exit(code=0)
+    for g in graphs:
+        typer.echo(f"  {g.graph_no}  v{g.graph_version}  [{g.status}]  {g.name}")
+
+
+@app.command("add-file")
+def add_file_cmd(
+    path: str = typer.Argument(..., help="File or directory to add to the manifest."),
+) -> None:
+    """Add a file or directory to the active graph's manifest."""
+    settings = get_settings()
+    if not graphs_mod.is_managed(settings.graph_no):
+        typer.echo(
+            "add-file requires a managed graph. Create one with create-graph and "
+            "pass --graph-no."
+        )
+        raise typer.Exit(code=1)
+    added = manifest_mod.add_file(settings.graph_no, path)
+    typer.echo(f"Added {len(added)} file(s) to {settings.graph_no}.")
+    for doc_no in added:
+        typer.echo(f"  + {doc_no}")
+
+
+@app.command("remove-file")
+def remove_file_cmd(
+    doc_no: str = typer.Argument(..., help="doc_no to remove (see list-files).")
+) -> None:
+    """Soft-remove a file from the active graph's manifest."""
+    settings = get_settings()
+    if manifest_mod.remove_file(settings.graph_no, doc_no):
+        typer.echo(f"Removed {doc_no} from {settings.graph_no}.")
+    else:
+        typer.echo(f"No manifest entry '{doc_no}' in {settings.graph_no}.")
+        raise typer.Exit(code=1)
+
+
+@app.command("list-files")
+def list_files_cmd() -> None:
+    """List the active graph's manifest files."""
+    settings = get_settings()
+    files = manifest_mod.list_files(settings.graph_no)
+    if not files:
+        typer.echo(f"No files in manifest for {settings.graph_no}.")
+        raise typer.Exit(code=0)
+    for f in files:
+        typer.echo(f"  {f.doc_no}  ({f.source_type})  {f.path}")
 
 
 @app.command("ingest-url")

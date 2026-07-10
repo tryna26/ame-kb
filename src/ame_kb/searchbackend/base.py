@@ -83,3 +83,19 @@ class HybridIndex(Protocol):
         """Delete every index row matching `filters` (used to drop a doc's chunks
         before re-chunking, since one doc maps to many chunk rows)."""
         ...
+
+    def copy_version(
+        self,
+        graph_no: str,
+        object_type: str,
+        object_nos: Sequence[str],
+        from_version: int,
+        to_version: int,
+        *,
+        session=None,
+    ) -> int:
+        """Copy index rows for `object_nos` from (graph_no, from_version) to
+        (graph_no, to_version), preserving the stored embedding so projected
+        objects stay searchable without being re-embedded. Returns rows copied.
+        A SQL backend joins the caller's `session`; others ignore it."""
+        ...
