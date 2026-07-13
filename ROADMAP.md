@@ -41,8 +41,8 @@
 | V2 | 多源接入（pdf/html）+ 半动态属性 + hash 增量 + 边置信 | ✅ 已交付 |
 | V3 | 全混合召回：FULLTEXT(ngram) + 向量 cosine + RRF + 10 步召回 + Ref 取原文 | ✅ 已交付 |
 | V4 | 可切换搜索后端 + doc chunk + 多 query + 多跳 + 重试阶梯 + URL 接入 | ✅ 已交付 |
-| V5 | 实体对齐与融合 + 半动态 schema | ✅ 核心已交付（代码源后移） |
-| V6 | 版本化 + 规模化 pipeline + Agent 接口(REST/MCP) + UI | 🟡 V6.2 已交付 |
+| V5 | 实体对齐与融合 + 固定两层本体（属性半动态） | ✅ 核心已交付（代码源后移） |
+| V6 | 版本化 + 规模化 pipeline + Agent 接口(REST/MCP) + UI | 🟡 V6.3 已交付（REST；MCP/UI 待做） |
 | V7 | 高级能力（多租户 / schema 演化 / 图算法 / 图库迁移） | 🔴 可选 |
 
 ---
@@ -55,8 +55,8 @@
 |---|---|---|
 | 本地 md/txt 按行号读取 | `src/ame_kb/ingest.py` | oceanai `addLineNumbers` |
 | 固定 schema + LLM 单步抽取 | `src/ame_kb/extract.py`、`schema.py`、`prompts/extract_v1.txt` | oceanai 抽取 prompt |
-| MySQL 三表（domain_entity/node/edge） | `sql/001_init.sql`、`models.py` | oceanai_site 三表设计 |
-| node_no=type:slug(name) 去重 | `src/ame_kb/store.py` | — |
+| MySQL 三表（domain_entity/node/edge） | `sql/schema.sql`、`models.py` | oceanai_site 三表设计 |
+| node_no=type:spec:slug(name)（Asset）/ type:slug(name)（其它）去重 | `src/ame_kb/store.py` | — |
 | 按名查询 + 一跳关系 | `src/ame_kb/query.py` | — |
 
 ---
@@ -67,7 +67,7 @@
 |---|---|---|
 | md/txt/pdf/html loader | `src/ame_kb/sources.py` | oceanai「异构源归一成 doc」；`pypdf` / `trafilatura` |
 | 半动态属性（properties JSON 兜底） | `extract.py: validate`、`prompts/extract_v2.txt` | `general_recall/core/entity/byterag_store.go:642` extractRAGTextFromProperties |
-| 内容 hash 增量跳过 | `store.py`、`sql/002_doc_version.sql` | oceanai `saveIfChanged` |
+| 内容 hash 增量跳过 | `store.py`、`sql/schema.sql`（kg_doc_version） | oceanai `saveIfChanged` |
 | 边置信标签 EXTRACTED/INFERRED/AMBIGUOUS | `extract.py` | Graphify 边 provenance |
 
 ---
@@ -82,7 +82,7 @@
 | RRF 融合 | `src/ame_kb/rrf.py` | `utils/rrf.go:20`；`core/reranker/rrf_reranker.go` |
 | searchable_text = name+description+properties | `src/ame_kb/searchindex.py` | `core/entity/byterag_store.go:346,362` |
 | Ref → 原文行（范围展开、相邻≤3合并、±window） | `recall.py`（step 9） | `domain/service/recall/general_retriever.go:580`；`application/recall/method/general.go` + `doc_lines.go` |
-| FULLTEXT(ngram) + 向量 JSON + description 列 | `sql/003_recall.sql`、`models.py` | — |
+| FULLTEXT(ngram) + 向量 JSON + description 列 | `sql/schema.sql`（kg_search_index）、`models.py` | — |
 | embedding 客户端（批量、独立 endpoint） | `src/ame_kb/embed.py` | `extract.py` OpenAI client 写法 |
 
 **10 步召回流程**（V3 单 query / 单跳，V4 在此基础上扩展）：
@@ -116,7 +116,7 @@ recall(query):
 | **Redis 后端**（RediSearch FT + VECTOR KNN + RRF，`SEARCH_BACKEND=redis`） | `searchbackend/redis.py` | Redis Stack `FT.CREATE ... VECTOR`；TAG 过滤范式 `core/entity/filter_dsl_test.go` |
 | **纯向量数学**（cosine，避免 import 环） | `src/ame_kb/vecmath.py` | — |
 | **doc chunk 切片**（滑窗+重叠，记录 line_start/end） | `src/ame_kb/chunker.py` | `core/entity/sync_spec_doc_chunk.go:130` splitTextIntoChunks |
-| **doc chunk 持久化 + 索引**（按 doc sha256 增量，delete-by-filter 重建） | `src/ame_kb/docchunk.py`、`sql/004_v4.sql`（kg_doc_chunk） | `byterag_store.go:204` DocChunkUpToDate、`:522` delete-by-filter |
+| **doc chunk 持久化 + 索引**（按 doc sha256 增量，delete-by-filter 重建） | `src/ame_kb/docchunk.py`、`sql/schema.sql`（kg_doc_chunk） | `byterag_store.go:204` DocChunkUpToDate、`:522` delete-by-filter |
 | **doc_chunk 第三通道兜底**（不受 graph_scope 约束） | `recall.py: _doc_chunk_channel` | `skills/knowledge-recall/references/sources.md:100`（④b） |
 | **多 query 改写 + RRF 合并** | `src/ame_kb/queryexpand.py` | `application/recall/method/rag_retrieve.go:208`；`sources.md:80` |
 | **多跳邻居展开**（frontier BFS + visited 防环 + 缺口驱动，≤N 跳） | `recall.py: _expand_neighbors` | `sources.md:134`（③b）；`domain/service/recall/graph_explorer.go:202` traversalRetrieve + `:691` markExploredEntityIDs |
@@ -161,7 +161,7 @@ RETRY_STRICT_TEXT/EMBEDDING=0.8 # 阶梯首档阈值
 
 ---
 
-## V5 — 实体对齐与融合 + 半动态 schema ✅（核心验收已完成）
+## V5 — 实体对齐与融合 + 固定两层本体（属性半动态）✅（核心验收已完成）
 
 **目标**：从"抽出一堆点"变成"稳定的知识实体"。向量在这里从"搜索入口"升级为"实体治理基建"。
 
@@ -176,8 +176,12 @@ Resolution:
 - 字段并集融合 + Ref 合并
 - 边重新挂到 canonical entity
 
-Schema:
-- 固定 schema -> 半动态；core fields 稳定，properties 承接长尾
+本体（两层固定，非动态）:
+- kg_graph_node 收敛为结构层（type 恒为 ENTITY）；kg_domain_entity 为本体层，
+  type 存 Asset/Relation/Event/Behavior，Asset 再带 entity_spec 原型
+  Mission/Solution/Implementation/ServiceInstance/Artifact，两层以 graph_node_no 关联
+- 类型/原型是固定闭集（schema.py 纯静态，不查库、不可发明新类型）；
+  只有节点/边的 properties 属性半动态（本体外的额外属性进 JSON 兜底）
 - schema 字段归一化（后续增强）
 - 代码源 tree-sitter（Function/Class/Module 节点，EXTRACTED 边，后续增强）
 ```
@@ -205,7 +209,7 @@ new_entity:
 | 字段并集 / Ref 合并 | 本项目 `store.py: _merge_ref`（扩到字段并集） |
 | 边改挂 canonical | `node_retriever.go` 端点映射逻辑 |
 | 代码源 tree-sitter | 外部 `github.com/tree-sitter/tree-sitter` + `py-tree-sitter` |
-| 动态 schema | 本项目 `schema.py`；`core/entity/retrieve_params.go` |
+| 固定两层本体 | 本项目 `schema.py`（纯静态闭集）、`store.py: load_domain_map` |
 
 ### V5 表 / 基建
 
@@ -218,7 +222,7 @@ new_entity:
 1. ✅ 同一实体跨多文档出现不重复成多个主实体
 2. ✅ 字段能融合，别名能搜到主实体
 3. ✅ 合并错误可回滚
-4. ✅ schema 从固定平滑过渡到半动态，core fields 不漂
+4. ✅ 本体两层固定（结构层 ENTITY + 本体层 Asset/Relation/Event/Behavior），core fields 不漂，属性走 properties 兜底
 
 > `normalized_name` 独立字段、schema 字段归一化和代码源 tree-sitter 尚未实现，作为后续独立增强项，不阻塞上述 V5 核心验收。
 
@@ -248,7 +252,13 @@ new_entity:
 - `task-status / list-tasks` 提供任务、run、文档步骤三级进度与错误观测。
 - MySQL 保存权威状态；Redis 是可选唤醒队列，失败时回退数据库轮询，并与 RediSearch 分 DB/实例。
 
-下一阶段为 V6.3：抽出 service 层并提供 REST API / MCP server。
+### V6.3 — Service 层 + REST API + 召回可观测 🟡（MCP/UI 待做）
+
+- 新增 `service.py` 薄 facade：CLI 与 REST 共用，统一在每次调用处套请求/任务级 `graph_context`（解析 graph_no + 最新 ACTIVE 版本），底层 module 函数保持不动、行为不变。
+- `recall` 增加 `RecallSession` trace（`trace=False` 默认零开销）：记录 embedding 可用性、改写后的多 query、每 query 池大小、重试 tier、逐跳邻居数、node/edge/doc_chunk 各通道命中量。CLI `search --trace` 打印，REST 默认返回，作为给 Agent 的召回解释。
+- 新增 `api.py`（FastAPI，可选依赖 `pip install ame-kb[api]`）：`/search`、`/graphs`、`/graphs/{no}/entities`、`/graphs/{no}/ingest`、`/tasks`、`/tasks/{no}`、`/tasks/{no}/retry` 等；每请求经 `graph_context` 隔离，并发安全。CLI `serve` 启动。
+- 测试 `test_v63`：service 图上下文解析/不泄漏、recall trace 字段、REST 端点（TestClient，service mock）。全量 85 passed。
+- 待做：MCP server（Agent memory interface）、UI 图可视化。
 
 ### 功能范围
 
@@ -258,7 +268,8 @@ Pipeline:
 - ✅ 进度可观测、失败重试、checkpoint、增量更新
 
 API:
-- REST API
+- ✅ Service 层（CLI/REST 共用，请求级 graph_context 隔离）
+- ✅ REST API（召回 + 管线全套）
 - MCP server（Agent memory interface）
 
 UI:
@@ -269,7 +280,7 @@ UI:
 
 不做默认全图 BFS，按 knowledge-recall 方式：先跑一跳 → 看子问题证据缺口 →
 从邻居挑相关 NodeName 当新 query → 再召回 → 维护 visited → 最多额外 2 跳。
-（V4 已实现 `_expand_neighbors`，V6 增加 session 日志与可观测。）
+（V4 已实现 `_expand_neighbors`，V6.3 已加 session trace 与可观测。）
 
 ### 借鉴地址
 
@@ -292,9 +303,9 @@ UI:
 ### V6 验收标准
 
 1. ✅ 大批文档可后台处理，失败可重试、可断点续跑
-2. 🟡 已返回 seeds / 邻居 / 证据来源；session 路径日志留待 V6.3
-3. Agent 可通过 REST / MCP 调用召回
-4. 图可视化能辅助人工修正实体/边
+2. ✅ 返回 seeds / 邻居 / 证据来源 + session trace（V6.3 已加）
+3. 🟡 Agent 可通过 REST 调用召回（V6.3 已交付 REST；MCP 待做）
+4. 图可视化能辅助人工修正实体/边（待做）
 
 ---
 
@@ -302,7 +313,7 @@ UI:
 
 | 条目 | 借鉴 |
 |---|---|
-| schema 自动演化 | `general_recall/core/entity/sync_spec.go`（spec 注册机制） |
+| 本体演化（新增元类型/原型，当前为固定闭集） | `general_recall/core/entity/sync_spec.go`（spec 注册机制） |
 | 权限隔离 / 多租户 | `workspace_id`（V4 已建 dormant 字段）；`sources.md:32` workspace_ids |
 | 社区发现 / 图算法 | 外部 networkx / Neo4j GDS |
 | 图数据库迁移 | 外部 Neo4j，**仅在 MySQL 边表频繁复杂路径 / 深层遍历明显卡顿时才考虑，非默认** |

@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 redis = ["redis>=5.0"]
+api = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
 ame-kb = "ame_kb.cli:app"

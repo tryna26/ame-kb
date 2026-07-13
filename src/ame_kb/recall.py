@@ -84,6 +84,36 @@ class DocChunkHit:
 
 
 @dataclass
+class HopTrace:
+    hop: int
+    candidates: int
+    picked: int
+
+
+@dataclass
+class RecallSession:
+    """Per-recall observability trace (off by default, zero cost when unused).
+
+    Records the decisions behind a recall so callers (CLI --trace, REST) can
+    explain "why these results": embedding availability, expanded queries, retry
+    tier used, per-query pool sizes, per-hop neighbor counts, and channel hits.
+    """
+
+    query: str
+    embedding_available: bool = False
+    queries: List[str] = field(default_factory=list)
+    pool_sizes: List[int] = field(default_factory=list)
+    tier_used: int = 0
+    pool_size: int = 0
+    seed_count: int = 0
+    neighbor_count: int = 0
+    edge_count: int = 0
+    evidence_count: int = 0
+    doc_chunk_count: int = 0
+    hops: List[HopTrace] = field(default_factory=list)
+
+
+@dataclass
 class RecallResult:
     query: str
     seeds: List[NodeResult] = field(default_factory=list)
@@ -92,6 +122,7 @@ class RecallResult:
     evidence: List[EvidenceLine] = field(default_factory=list)
     doc_chunks: List[DocChunkHit] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    session: Optional["RecallSession"] = None
 
 
 def build_candidate_pool(
@@ -466,6 +497,7 @@ def _expand_neighbors(
     neighbor_k: int,
     max_hops: int,
     warnings: List[str],
+    trace: Optional["RecallSession"] = None,
 ) -> Tuple[List[str], List[GraphEdge], Dict[str, GraphNode]]:
     """Bounded, gap-driven multi-hop neighbor expansion.
 
@@ -485,7 +517,7 @@ def _expand_neighbors(
     picked: List[str] = []  # neighbor_nos in rank order, deduped
 
     hops = max(1, max_hops)
-    for _ in range(hops):
+    for hop in range(hops):
         if not frontier:
             break
         hop_edges = _one_hop_edges(session, frontier)
@@ -511,6 +543,7 @@ def _expand_neighbors(
         ordered = ranked + [no for no in candidates if no not in set(ranked)]
 
         next_frontier: List[str] = []
+        picked_before = len(picked)
         for no in ordered:
             if no in visited:
                 continue
@@ -518,6 +551,14 @@ def _expand_neighbors(
             next_frontier.append(no)
             if no not in picked:
                 picked.append(no)
+        if trace is not None:
+            trace.hops.append(
+                HopTrace(
+                    hop=hop + 1,
+                    candidates=len(candidates),
+                    picked=len(picked) - picked_before,
+                )
+            )
         # Gap-driven: stop once we already have enough neighbors.
         if len(picked) >= neighbor_k:
             break
@@ -531,11 +572,15 @@ def _expand_neighbors(
     return neighbor_nos, all_edges, node_cache
 
 
-def recall(query: str, window: int = 0) -> RecallResult:
+def recall(query: str, window: int = 0, trace: bool = False) -> RecallResult:
     settings = get_settings()
     result = RecallResult(query=query)
+    session_trace = RecallSession(query=query) if trace else None
+    result.session = session_trace
 
     query_embedding = _embed_query(query, result.warnings)
+    if session_trace is not None:
+        session_trace.embedding_available = query_embedding is not None
 
     top_k = settings.recall_topk
     neighbor_k = settings.recall_neighbor_topk
@@ -546,6 +591,8 @@ def recall(query: str, window: int = 0) -> RecallResult:
     # the pool-building steps per query, then RRF-fuse the orderings
     # (rag_retrieve.go:149-194). Single-query keeps V3 behaviour exactly.
     queries = expand_queries(query, result.warnings)
+    if session_trace is not None:
+        session_trace.queries = list(queries)
 
     def _build_pool(session, tier: Optional["RecallTier"]) -> List[str]:
         pools: List[List[str]] = []
@@ -556,6 +603,8 @@ def recall(query: str, window: int = 0) -> RecallResult:
                     session, q, q_emb, wide, result.warnings, tier=tier
                 )
             )
+        if session_trace is not None:
+            session_trace.pool_sizes = [len(p) for p in pools]
         return pools[0] if len(pools) == 1 else rrf_merge(pools)
 
     with session_scope() as session:
@@ -570,6 +619,8 @@ def recall(query: str, window: int = 0) -> RecallResult:
             ordered_pool = []
             for i, tier in enumerate(_retry_ladder()):
                 ordered_pool = _build_pool(session, tier=tier)
+                if session_trace is not None:
+                    session_trace.tier_used = i + 1
                 if len(ordered_pool) >= min_results:
                     break
                 if i > 0:
@@ -577,6 +628,8 @@ def recall(query: str, window: int = 0) -> RecallResult:
                         f"retry ladder tier {i + 1}: "
                         f"{len(ordered_pool)}/{min_results} results"
                     )
+        if session_trace is not None:
+            session_trace.pool_size = len(ordered_pool)
 
         # Step 5: topK seeds.
         seed_nos = ordered_pool[:top_k]
@@ -593,6 +646,7 @@ def recall(query: str, window: int = 0) -> RecallResult:
             neighbor_k,
             settings.recall_max_hops,
             result.warnings,
+            trace=session_trace,
         )
 
         # Join the domain layer to surface the ontology class + archetype for all
@@ -643,6 +697,13 @@ def recall(query: str, window: int = 0) -> RecallResult:
         result.doc_chunks = _doc_chunk_channel(
             session, query, query_embedding, result.warnings
         )
+
+    if session_trace is not None:
+        session_trace.seed_count = len(result.seeds)
+        session_trace.neighbor_count = len(result.neighbors)
+        session_trace.edge_count = len(result.edges)
+        session_trace.evidence_count = len(result.evidence)
+        session_trace.doc_chunk_count = len(result.doc_chunks)
 
     # Step 10: return.
     return result

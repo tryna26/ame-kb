@@ -11,19 +11,17 @@ from . import ingest as ingest_mod
 from . import graphs as graphs_mod
 from . import manifest as manifest_mod
 from . import pipeline as pipeline_mod
+from . import service as service_mod
 from . import versioning as versioning_mod
 from .config import get_settings
 from .db import get_engine, ping
 from .extract import extract
-from .query import find_entities, relations_of
-from .recall import recall
 from .reindex import reindex_all
-from .resolve import alias_of, resolve_all, rollback
 from .store import is_unchanged, node_no, store
 
 app = typer.Typer(
     add_completion=False,
-    help="Versioned knowledge-recall and agent-memory core (V6.2).",
+    help="Versioned knowledge-recall and agent-memory core (V6.3).",
 )
 
 
@@ -224,7 +222,7 @@ def enqueue_ingest_cmd(
         typer.echo("enqueue-ingest requires a managed graph (--graph-no).")
         raise typer.Exit(code=1)
     try:
-        result = pipeline_mod.enqueue_ingest(
+        result = service_mod.enqueue_ingest(
             settings.graph_no,
             force=force,
             allow_empty=allow_empty,
@@ -255,7 +253,7 @@ def worker_cmd(
         typer.echo(f"{result.task_no}: {result.status}{retry}{suffix}")
 
     try:
-        results = pipeline_mod.run_worker(
+        results = service_mod.run_worker(
             once=once,
             max_tasks=max_tasks,
             worker_id=worker_id,
@@ -273,7 +271,7 @@ def task_status_cmd(task_no: str = typer.Argument(...)) -> None:
     """Show task, run, and per-document checkpoint progress."""
 
     try:
-        snapshot = pipeline_mod.task_snapshot(task_no)
+        snapshot = service_mod.task_status(task_no)
     except ValueError as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from exc
@@ -305,7 +303,7 @@ def list_tasks_cmd(limit: int = typer.Option(20, min=1)) -> None:
 
     settings = get_settings()
     graph_no = None if settings.graph_no == "default" else settings.graph_no
-    for row in pipeline_mod.list_tasks(graph_no, limit):
+    for row in service_mod.list_tasks(graph_no, limit):
         typer.echo(
             f"{row['task_no']} [{row['status']}] graph={row['graph_no']} "
             f"progress={row['progress_current']}/{row['progress_total']} "
@@ -321,7 +319,7 @@ def retry_task_cmd(
     """Manually requeue a terminal FAILED task, preserving completed checkpoints."""
 
     try:
-        pipeline_mod.retry_task(task_no, max_attempts=max_attempts)
+        service_mod.retry_task(task_no, max_attempts=max_attempts)
     except ValueError as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from exc
@@ -456,7 +454,7 @@ def query_cmd(
     ),
 ) -> None:
     """Find entities by name and (optionally) list their direct relations."""
-    hits = find_entities(name)
+    hits = service_mod.find_entities(name)
     if not hits:
         typer.echo(f"No entity matching '{name}'.")
         raise typer.Exit(code=0)
@@ -465,7 +463,7 @@ def query_cmd(
         if h.properties:
             typer.echo(f"    properties: {h.properties}")
         if relations:
-            for r in relations_of(h.graph_node_no):
+            for r in service_mod.relations_of(h.graph_node_no):
                 arrow = "-->" if r.direction == "out" else "<--"
                 typer.echo(
                     f"    {arrow} {r.label} [{r.other_type}] {r.other_name}"
@@ -478,10 +476,13 @@ def search_cmd(
     window: int = typer.Option(
         0, help="Expand evidence lines by ±window around each cited line."
     ),
+    trace: bool = typer.Option(
+        False, help="Print a recall session trace (pool sizes, tiers, hops)."
+    ),
 ) -> None:
     """Run hybrid recall (FULLTEXT + vector, RRF) and print seeds, neighbors,
     connecting edges, and the original evidence lines."""
-    res = recall(query, window=window)
+    res = service_mod.search(query, window=window, trace=trace)
     for w in res.warnings:
         typer.echo(f"  warning: {w}")
 
@@ -519,6 +520,23 @@ def search_cmd(
         typer.echo(
             f"  {c.doc_no}#{c.chunk_index} (L{c.line_start}-{c.line_end}) {src}\n"
             f"      {snippet}"
+        )
+
+    if res.session is not None:
+        s = res.session
+        typer.echo("\n# Session trace")
+        typer.echo(f"  embedding_available: {s.embedding_available}")
+        typer.echo(f"  queries: {s.queries}")
+        typer.echo(f"  pool_sizes: {s.pool_sizes}  final_pool: {s.pool_size}")
+        typer.echo(f"  tier_used: {s.tier_used}")
+        for h in s.hops:
+            typer.echo(
+                f"  hop {h.hop}: {h.candidates} candidate(s), {h.picked} picked"
+            )
+        typer.echo(
+            f"  counts: seeds={s.seed_count} neighbors={s.neighbor_count} "
+            f"edges={s.edge_count} evidence={s.evidence_count} "
+            f"doc_chunks={s.doc_chunk_count}"
         )
 
 
@@ -560,7 +578,7 @@ def resolve_cmd(
     """Cross-document entity fusion: find duplicate nodes (vector/full-text KNN),
     LLM-judge same/related/different, and merge duplicates into a canonical
     survivor. Merges record an alias + a rollback-able audit row."""
-    stats = resolve_all(type_filter=type_, dry_run=dry_run, limit=limit)
+    stats = service_mod.resolve_all(type_filter=type_, dry_run=dry_run, limit=limit)
     for j in stats.judgments:
         typer.echo(f"  {j}")
     verb = "would merge" if dry_run else "merged"
@@ -575,7 +593,7 @@ def rollback_merge_cmd(merge_id: str = typer.Argument(..., help="merge_id to und
     """Undo a merge from its snapshot (restore both nodes, un-remap edges, drop
     the added aliases)."""
     try:
-        rollback(merge_id)
+        service_mod.rollback_merge(merge_id)
     except ValueError as exc:
         typer.echo(f"Cannot rollback: {exc}")
         raise typer.Exit(code=1)
@@ -587,12 +605,30 @@ def alias_of_cmd(
     entity: str = typer.Argument(..., help="Canonical node_no or exact name.")
 ) -> None:
     """List the aliases that resolve to a canonical entity."""
-    aliases = alias_of(entity)
+    aliases = service_mod.alias_of(entity)
     if not aliases:
         typer.echo(f"No aliases for '{entity}'.")
         raise typer.Exit(code=0)
     for a in aliases:
         typer.echo(f"  {a}")
+
+
+@app.command("serve")
+def serve_cmd(
+    host: str = typer.Option("127.0.0.1", help="Bind host."),
+    port: int = typer.Option(8000, help="Bind port."),
+) -> None:
+    """Serve the REST API (requires the `api` extra: pip install ame-kb[api])."""
+    try:
+        import uvicorn
+
+        from .api import create_app
+    except ImportError as exc:
+        typer.echo(
+            "REST API dependencies missing. Install with: pip install 'ame-kb[api]'"
+        )
+        raise typer.Exit(code=1) from exc
+    uvicorn.run(create_app(), host=host, port=port)
 
 
 if __name__ == "__main__":
