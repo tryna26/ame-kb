@@ -48,10 +48,16 @@ class Settings(BaseModel):
     recall_min_results: int
     retry_strict_text: float
     retry_strict_embedding: float
-    # V5: entity fusion (resolve) + semi-dynamic schema knobs.
+    # V5: entity fusion (resolve) knobs.
     resolve_candidate_topk: int
     resolve_min_score_embedding: float
-    schema_dynamic: bool
+    # V6.2: durable pipeline + optional Redis wake-up queue.
+    pipeline_queue_backend: str
+    pipeline_redis_url: str
+    pipeline_queue_key: str
+    pipeline_poll_seconds: float
+    pipeline_retry_delay_seconds: int
+    pipeline_lease_seconds: int
 
 
 @dataclass(frozen=True)
@@ -139,8 +145,16 @@ def _base_settings() -> Settings:
         resolve_min_score_embedding=float(
             os.getenv("RESOLVE_MIN_SCORE_EMBEDDING", "0")
         ),
-        schema_dynamic=os.getenv("SCHEMA_DYNAMIC", "false").lower()
-        in ("1", "true", "yes"),
+        pipeline_queue_backend=os.getenv("PIPELINE_QUEUE_BACKEND", "database"),
+        pipeline_redis_url=os.getenv(
+            "PIPELINE_REDIS_URL", "redis://localhost:6379/1"
+        ),
+        pipeline_queue_key=os.getenv("PIPELINE_QUEUE_KEY", "amekb:pipeline:ready"),
+        pipeline_poll_seconds=float(os.getenv("PIPELINE_POLL_SECONDS", "2")),
+        pipeline_retry_delay_seconds=int(
+            os.getenv("PIPELINE_RETRY_DELAY_SECONDS", "5")
+        ),
+        pipeline_lease_seconds=int(os.getenv("PIPELINE_LEASE_SECONDS", "900")),
     )
 
 

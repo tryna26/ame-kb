@@ -9,6 +9,7 @@ from sqlalchemy import or_, select
 from .config import get_settings
 from .db import session_scope
 from .models import GraphEdge, GraphNode
+from .store import load_domain_map
 
 
 @dataclass
@@ -45,8 +46,20 @@ def find_entities(name: str, limit: int = 20) -> List[NodeHit]:
             .scalars()
             .all()
         )
+        domain_map = load_domain_map(
+            session,
+            settings.graph_no,
+            settings.graph_version,
+            [r.graph_node_no for r in rows],
+        )
         return [
-            NodeHit(r.graph_node_no, r.name, r.type, r.properties or {}) for r in rows
+            NodeHit(
+                r.graph_node_no,
+                r.name,
+                domain_map.get(r.graph_node_no, (r.type, None))[0],
+                r.properties or {},
+            )
+            for r in rows
         ]
 
 
@@ -82,6 +95,16 @@ def relations_of(node_no: str) -> List[RelationHit]:
             .scalars()
             .all()
         )
+        other_nos = [
+            e.target_node_no if e.source_node_no == node_no else e.source_node_no
+            for e in edges
+        ]
+        domain_map = load_domain_map(
+            session,
+            settings.graph_no,
+            settings.graph_version,
+            other_nos,
+        )
         for e in edges:
             if e.source_node_no == node_no:
                 other = _node_by_no(session, e.target_node_no)
@@ -91,13 +114,16 @@ def relations_of(node_no: str) -> List[RelationHit]:
                 other = _node_by_no(session, e.source_node_no)
                 direction = "in"
                 other_no = e.source_node_no
+            other_type = "?"
+            if other is not None:
+                other_type = domain_map.get(other_no, (other.type, None))[0]
             hits.append(
                 RelationHit(
                     direction=direction,
                     label=e.name,
                     other_no=other_no,
                     other_name=other.name if other else "(missing)",
-                    other_type=other.type if other else "?",
+                    other_type=other_type,
                 )
             )
     return hits

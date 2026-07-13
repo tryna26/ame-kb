@@ -1,4 +1,4 @@
-"""ame-kb V3 CLI: init-db, ingest, query, search, reindex."""
+"""ame-kb CLI: versioned ingest, async pipeline, query, search, reindex."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,6 +10,7 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 from . import ingest as ingest_mod
 from . import graphs as graphs_mod
 from . import manifest as manifest_mod
+from . import pipeline as pipeline_mod
 from . import versioning as versioning_mod
 from .config import get_settings
 from .db import get_engine, ping
@@ -18,12 +19,11 @@ from .query import find_entities, relations_of
 from .recall import recall
 from .reindex import reindex_all
 from .resolve import alias_of, resolve_all, rollback
-from .schema import seed_schema
 from .store import is_unchanged, node_no, store
 
 app = typer.Typer(
     add_completion=False,
-    help="Versioned knowledge-recall and agent-memory core (V6.1).",
+    help="Versioned knowledge-recall and agent-memory core (V6.2).",
 )
 
 
@@ -43,22 +43,6 @@ def _main(
     """
     graphs_mod.apply_graph_context(graph_no, graph_version)
 
-
-@app.callback()
-def _main(
-    graph_no: str = typer.Option(
-        None, "--graph-no", help="Target graph (system-generated graph_<id>)."
-    ),
-    graph_version: int = typer.Option(
-        None, "--graph-version", help="Pin a specific version (default: latest)."
-    ),
-) -> None:
-    """Inject the graph context (graph_no + resolved version) for every command.
-
-    Fault tolerant: on a fresh DB (no kg_graph yet) the version lookup is
-    skipped/swallowed so init-db can create the tables it depends on.
-    """
-    graphs_mod.apply_graph_context(graph_no, graph_version)
 
 _SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
 
@@ -102,7 +86,7 @@ def _run_sql_file(path: Path) -> None:
 
 @app.command("init-db")
 def init_db() -> None:
-    """Probe connectivity, create the tables, and seed the fixed schema."""
+    """Probe connectivity and create the tables. Schema is a fixed ontology."""
     typer.echo("Checking MySQL connectivity...")
     ping()
     typer.echo("  OK")
@@ -110,8 +94,6 @@ def init_db() -> None:
         typer.echo(f"Applying DDL from {sql_file.name}...")
         _run_sql_file(sql_file)
     typer.echo("  tables ready")
-    inserted = seed_schema()
-    typer.echo(f"Seeded schema: {inserted} new type row(s).")
 
     # When the Redis backend is active, create its FT index too.
     if get_settings().search_backend.lower() == "redis":
@@ -173,8 +155,9 @@ def ingest_cmd(
             typer.echo(f"  dropped: {d}")
         if dry_run:
             for n in result.nodes:
+                spec = f"/{n.entity_spec}" if n.entity_spec else ""
                 typer.echo(
-                    f"    node  {n.type}: {n.name} :: {n.description} "
+                    f"    node  {n.entity_type}{spec}: {n.name} :: {n.description} "
                     f"{n.properties} src={n.source}"
                 )
             for e in result.edges:
@@ -226,6 +209,123 @@ def _ingest_managed(
         f"extracted {res.extracted_docs} doc(s)."
     )
     typer.echo(f"Built v{res.target_version} (ACTIVE).")
+
+
+@app.command("enqueue-ingest")
+def enqueue_ingest_cmd(
+    force: bool = typer.Option(False, help="Re-extract unchanged documents."),
+    allow_empty: bool = typer.Option(False, help="Allow a no-change version."),
+    max_attempts: int = typer.Option(3, min=1, help="Automatic task attempts."),
+) -> None:
+    """Snapshot the active graph manifest and enqueue a durable background ingest."""
+
+    settings = get_settings()
+    if not graphs_mod.is_managed(settings.graph_no):
+        typer.echo("enqueue-ingest requires a managed graph (--graph-no).")
+        raise typer.Exit(code=1)
+    try:
+        result = pipeline_mod.enqueue_ingest(
+            settings.graph_no,
+            force=force,
+            allow_empty=allow_empty,
+            max_attempts=max_attempts,
+        )
+    except ValueError as exc:
+        typer.echo(f"Cannot enqueue: {exc}")
+        raise typer.Exit(code=1) from exc
+    action = "Enqueued" if result.created else "Already active"
+    typer.echo(f"{action}: {result.task_no}")
+    if result.warning:
+        typer.echo(f"  warning: {result.warning}")
+
+
+@app.command("worker")
+def worker_cmd(
+    once: bool = typer.Option(False, help="Process at most one available task."),
+    max_tasks: int = typer.Option(
+        0, min=0, help="Exit after N tasks; 0 keeps running."
+    ),
+    worker_id: str = typer.Option(None, help="Worker identity (auto-generated)."),
+) -> None:
+    """Run the durable ingest worker (Ctrl-C to stop continuous mode)."""
+
+    def _show(result: pipeline_mod.ProcessResult) -> None:
+        suffix = f"  {result.error}" if result.error else ""
+        retry = " (retry queued)" if result.will_retry else ""
+        typer.echo(f"{result.task_no}: {result.status}{retry}{suffix}")
+
+    try:
+        results = pipeline_mod.run_worker(
+            once=once,
+            max_tasks=max_tasks,
+            worker_id=worker_id,
+            on_result=_show,
+        )
+    except KeyboardInterrupt:
+        typer.echo("Worker stopped.")
+        raise typer.Exit(code=0)
+    if once and not results:
+        typer.echo("No eligible task.")
+
+
+@app.command("task-status")
+def task_status_cmd(task_no: str = typer.Argument(...)) -> None:
+    """Show task, run, and per-document checkpoint progress."""
+
+    try:
+        snapshot = pipeline_mod.task_snapshot(task_no)
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        f"{snapshot['task_no']} [{snapshot['status']}] graph={snapshot['graph_no']} "
+        f"progress={snapshot['progress_current']}/{snapshot['progress_total']} "
+        f"attempts={snapshot['attempts']}/{snapshot['max_attempts']}"
+    )
+    if snapshot["error"]:
+        typer.echo(f"  error: {snapshot['error']}")
+    run = snapshot["run"]
+    if run:
+        typer.echo(
+            f"  run {run['run_no']} [{run['status']}] "
+            f"v{run['base_version'] or '-'} -> v{run['target_version']}"
+        )
+    for step in snapshot["steps"]:
+        typer.echo(
+            f"  {step['doc_no']} [{step['status']}] "
+            f"attempts={step['attempts']}/{step['max_attempts']}"
+        )
+        if step["error"]:
+            typer.echo(f"    error: {step['error']}")
+
+
+@app.command("list-tasks")
+def list_tasks_cmd(limit: int = typer.Option(20, min=1)) -> None:
+    """List recent tasks, scoped to --graph-no when provided/configured."""
+
+    settings = get_settings()
+    graph_no = None if settings.graph_no == "default" else settings.graph_no
+    for row in pipeline_mod.list_tasks(graph_no, limit):
+        typer.echo(
+            f"{row['task_no']} [{row['status']}] graph={row['graph_no']} "
+            f"progress={row['progress_current']}/{row['progress_total']} "
+            f"attempts={row['attempts']}/{row['max_attempts']}"
+        )
+
+
+@app.command("retry-task")
+def retry_task_cmd(
+    task_no: str = typer.Argument(...),
+    max_attempts: int = typer.Option(None, min=1, help="Override retry budget."),
+) -> None:
+    """Manually requeue a terminal FAILED task, preserving completed checkpoints."""
+
+    try:
+        pipeline_mod.retry_task(task_no, max_attempts=max_attempts)
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Requeued {task_no}.")
 
 
 @app.command("create-graph")
@@ -387,13 +487,15 @@ def search_cmd(
 
     typer.echo(f"\n# Seeds ({len(res.seeds)})")
     for s in res.seeds:
-        typer.echo(f"  [{s.type}] {s.name}  ({s.graph_node_no})")
+        spec = f"/{s.entity_spec}" if s.entity_spec else ""
+        typer.echo(f"  [{s.type}{spec}] {s.name}  ({s.graph_node_no})")
         if s.description:
             typer.echo(f"      {s.description}")
 
     typer.echo(f"\n# Neighbors ({len(res.neighbors)})")
     for n in res.neighbors:
-        typer.echo(f"  [{n.type}] {n.name}  ({n.graph_node_no})")
+        spec = f"/{n.entity_spec}" if n.entity_spec else ""
+        typer.echo(f"  [{n.type}{spec}] {n.name}  ({n.graph_node_no})")
         if n.description:
             typer.echo(f"      {n.description}")
 
@@ -432,9 +534,15 @@ def reindex_cmd() -> None:
 
 
 @app.command("node-no")
-def node_no_cmd(type_: str = typer.Argument(...), name: str = typer.Argument(...)) -> None:
-    """Print the business key (graph_node_no) for a type/name pair."""
-    typer.echo(node_no(type_, name))
+def node_no_cmd(
+    type_: str = typer.Argument(...),
+    name: str = typer.Argument(...),
+    spec: str = typer.Option(
+        None, "--spec", help="Archetype (entity_spec); only for Asset nodes."
+    ),
+) -> None:
+    """Print the business key (graph_node_no) for a type/spec/name triple."""
+    typer.echo(node_no(type_, spec, name))
 
 
 @app.command("resolve")

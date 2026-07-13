@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from importlib import resources
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
@@ -13,8 +13,8 @@ from pydantic import BaseModel, ValidationError
 from .config import get_settings
 from .ingest import Document
 from .schema import (
-    edge_endpoints_ok,
-    load_types_from_db,
+    ENTITY_SPECS,
+    ENTITY_TYPES,
     schema_prompt_block,
 )
 
@@ -26,7 +26,8 @@ DEFAULT_CONFIDENCE = "INFERRED"
 
 class ExtractedNode(BaseModel):
     name: str
-    type: str
+    entity_type: str
+    entity_spec: Optional[str] = None
     description: str = ""
     properties: Dict[str, object] = {}
     source: List[str] = []
@@ -47,9 +48,6 @@ class ExtractionResult:
     nodes: List[ExtractedNode] = field(default_factory=list)
     edges: List[ExtractedEdge] = field(default_factory=list)
     dropped: List[str] = field(default_factory=list)
-    # V5: node types the LLM proposed that are not (yet) in the active schema.
-    # When SCHEMA_DYNAMIC is on, store registers these before persisting nodes.
-    pending_node_types: set = field(default_factory=set)
 
 
 def _load_prompt_template() -> str:
@@ -116,18 +114,15 @@ def call_llm(prompt: str) -> str:
 
 
 def validate(doc_id: str, payload: dict) -> ExtractionResult:
-    """Keep nodes/edges that satisfy the active type schema; record drops.
+    """Keep nodes/edges that satisfy the fixed ontology; record drops.
 
-    Semi-dynamic (V5): node/edge *types* are the seed schema UNION whatever is
-    registered in kg_domain_entity. A node whose type is unknown is normally
-    dropped, but when SCHEMA_DYNAMIC is on it is kept and its type recorded in
-    `pending_node_types` so store can register it before persisting.
+    A node is kept iff its entity_type is a valid metatype and, when the
+    metatype is Asset, its entity_spec is a valid archetype. Non-Asset nodes
+    must not carry an archetype. An edge is kept iff its confidence is valid and
+    both endpoints reference a kept node (referential integrity).
     """
     result = ExtractionResult(doc_id=doc_id)
     node_type_by_name: Dict[str, str] = {}
-    dynamic = get_settings().schema_dynamic
-    node_types, edge_types = load_types_from_db()
-    node_type_names = {t.name for t in node_types}
 
     for item in payload.get("nodes", []) or []:
         try:
@@ -135,15 +130,25 @@ def validate(doc_id: str, payload: dict) -> ExtractionResult:
         except ValidationError:
             result.dropped.append(f"node parse error: {item!r}")
             continue
-        if node.type not in node_type_names:
-            if dynamic and node.type:
-                result.pending_node_types.add(node.type)
-            else:
-                result.dropped.append(f"node bad type '{node.type}': {node.name}")
+        if not node.name:
+            result.dropped.append(f"node empty name: {item!r}")
+            continue
+        if node.entity_type not in ENTITY_TYPES:
+            result.dropped.append(
+                f"node bad entity_type '{node.entity_type}': {node.name}"
+            )
+            continue
+        if node.entity_type == "Asset":
+            if node.entity_spec not in ENTITY_SPECS:
+                result.dropped.append(
+                    f"node bad entity_spec '{node.entity_spec}': {node.name}"
+                )
                 continue
+        else:
+            node.entity_spec = None
         # Keep all properties (schema-declared + extra) as JSON fallback.
         result.nodes.append(node)
-        node_type_by_name[node.name] = node.type
+        node_type_by_name[node.name] = node.entity_type
 
     for item in payload.get("edges", []) or []:
         try:
@@ -157,16 +162,12 @@ def validate(doc_id: str, payload: dict) -> ExtractionResult:
                 f"{edge.source_name}->{edge.target_name}"
             )
             continue
-        src_type = node_type_by_name.get(edge.source_name)
-        dst_type = node_type_by_name.get(edge.target_name)
-        if src_type is None or dst_type is None:
+        if (
+            edge.source_name not in node_type_by_name
+            or edge.target_name not in node_type_by_name
+        ):
             result.dropped.append(
                 f"edge endpoint not a known node: {edge.source_name}->{edge.target_name}"
-            )
-            continue
-        if not edge_endpoints_ok(edge.label, src_type, dst_type, edge_types):
-            result.dropped.append(
-                f"edge bad label/endpoints '{edge.label}': {src_type}->{dst_type}"
             )
             continue
         result.edges.append(edge)
@@ -194,7 +195,6 @@ def _extract_span(doc_id: str, numbered_lines: List[str]) -> ExtractionResult:
         left.nodes.extend(right.nodes)
         left.edges.extend(right.edges)
         left.dropped.extend(right.dropped)
-        left.pending_node_types |= right.pending_node_types
         return left
     return validate(doc_id, payload)
 

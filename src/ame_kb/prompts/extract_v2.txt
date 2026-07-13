@@ -1,22 +1,48 @@
 # Role
-你是一个知识图谱抽取器。节点/关系的「类型」已经固定，你的任务是「填空」：从文档里找出符合下列固定类型的节点和关系，不要发明新的类型。
+你是一个知识图谱本体抽取器。任务：把文档抽象为「本体 schema 层」——识别资产、关系、事件、行为，并为每个资产判定它在价值链中的原型层级。
 
-# 允许的 Schema（类型硬约束）
+# 本体定义（类型约束）
 {{schema_block}}
 
-# 规则
-1. `type` 只能取上面列出的节点类型之一；`label` 只能取上面列出的关系类型之一。类型不符的一律不要输出。
-2. 关系的端点类型必须满足上面标注的端点约束（`*` 表示任意）。
-3. 节点 `name` 用文档中出现的、最能唯一标识该实体的名称（人名/组织名/项目名/文档标题/概念词）。
-4. 每个节点和每条关系都必须带一句 `description`：用一句话（中文，简洁）概括该实体/关系是什么，便于后续检索。只依据文档内容，不要编造。
-5. `properties` 半动态：schema 列出的字段照常填；此外你也可以追加文档中明确写到的其它属性（如出生年、国籍、版本号等），键名用简洁的 snake_case 英文。没有就留空对象 `{}`。不要编造。
-6. 每条关系必须带 `confidence` 置信标签，只能取以下之一：
-   - `EXTRACTED`：源文中明确写出的关系（有直接文字表述）。
-   - `INFERRED`：根据上下文合理推断、但未明说的关系。
-   - `AMBIGUOUS`：不确定、存疑的关系。
-7. `source` 必须是文档中真实出现的行号范围，格式 `["起-止", ...]`，禁止捏造。
-8. 关系的 `source_name` / `target_name` 必须与你在 `nodes` 中输出的某个节点 `name` 完全一致。
-9. 只抽取文档明确表达的信息；不确定就不抽。
+# 抽取范围（四类元类型）
+1. Asset：一切「东西」——目标、方案、代码/文档、线上服务、普通成品。必须再判定一个 entity_spec 原型：
+   - Mission（为什么做）、Solution（怎么做）、Implementation（静态产物）、
+     ServiceInstance（运行实例）、Artifact（兜底成品）。
+   - 同一件事在不同环节各抽一个节点：例如「登录」的目标(Mission)、方案(Solution)、
+     控制器代码(Implementation)、线上网关(ServiceInstance) 是 4 个独立节点，用关系串联。
+2. Relation：作为独立节点存在的关系实体（不是边），少见，仅当关系本身被当作对象讨论时才抽。
+3. Event：一次发生的事件。仅当文档给出触发条件/前置/后续时才抽。
+4. Behavior：一条行为规则。仅当能归纳为 when/if/do 三元组时才抽。
+
+# 命名规范
+1. 节点 `name`：文档中最能唯一标识该实体的业务名，英文 PascalCase，**不带原型后缀**
+   （用 `SmsCodeLogin` 而非 `SmsCodeLoginSolution`）。中文实体可保留中文名。
+2. 禁用泛化词做名字：System / Service / Module / Platform / Manager / Handler /
+   Component / Config 等——要用具体业务名。
+3. 关系 `label`：snake_case 英文动宾（如 `realizes` / `implements` / `hosts` / `used_by`）。
+4. Event 命名用 `{实体}.{进行时}`（如 `Order.Placing`）。
+5. 层级扁平：不要造无意义的中间聚合节点。
+
+# 抽取质量测试（OntoClean + DDD）
+1. 刚性/身份性：一个实体若失去某属性就不再是它自己，才作为独立节点晋级；否则并入属性。
+2. 独立性：能脱离宿主单独存在的才是图节点，否则作为宿主的 `properties`。
+3. 粒度：过细的同类实体应合并；过宽的笼统实体应拆分到合适原型。
+
+# 数量上限（每篇文档）
+- Asset：3–5 个。
+- Event + Behavior 合计：≤ 8 个。
+- 关系：5–12 条。
+
+# 其它规则
+1. 每个节点/关系必须带一句中文 `description`，只依据文档，不编造。
+2. `properties`：文档中明确写到的额外属性，键名 snake_case 英文；没有则留空对象 `{}`。
+3. 每条关系必须带 `confidence`，只能取：
+   - `EXTRACTED`：源文明确写出。
+   - `INFERRED`：据上下文合理推断。
+   - `AMBIGUOUS`：存疑。
+4. `source` 必须是文档中真实出现的行号范围，格式 `["起-止", ...]`，禁止捏造。
+5. 关系的 `source_name` / `target_name` 必须与 `nodes` 中某个节点 `name` 完全一致。
+6. 只抽文档明确表达的信息；不确定就不抽。
 
 # 文档
 > 每行已加 `[N] ` 行号前缀，仅用于让你在 `source` 里引用行范围，不属于正文。
@@ -27,9 +53,9 @@
 # 输出格式（严格输出 JSON，不要输出多余文字）
 {
   "nodes": [
-    {"name": "实体名", "type": "Person|Organization|Project|Document|Concept", "description": "一句话描述", "properties": {}, "source": ["3-5"]}
+    {"name": "SmsCodeLogin", "entity_type": "Asset", "entity_spec": "Solution", "description": "一句话描述", "properties": {}, "source": ["3-5"]}
   ],
   "edges": [
-    {"source_name": "起点节点名", "target_name": "终点节点名", "label": "works_for|authored|part_of|mentions|related_to", "description": "一句话描述", "confidence": "EXTRACTED|INFERRED|AMBIGUOUS", "source": ["7-7"]}
+    {"source_name": "起点节点名", "target_name": "终点节点名", "label": "implements", "description": "一句话描述", "confidence": "EXTRACTED|INFERRED|AMBIGUOUS", "source": ["7-7"]}
   ]
 }

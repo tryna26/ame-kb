@@ -1,9 +1,7 @@
-"""Offline V5 tests: fusion helpers, alias indexing, dynamic schema, judge
-parsing, and merge/rollback logic against an in-memory fake session.
+"""Offline V5 tests: fusion helpers, alias indexing, judge parsing, and
+merge/rollback logic against an in-memory fake session.
 No real DB/LLM/embedding calls."""
-import ame_kb.extract as extract_mod
 import ame_kb.resolve as resolve_mod
-import ame_kb.schema as schema_mod
 from ame_kb.searchindex import build_searchable_text
 from ame_kb.store import merge_props, merge_ref_maps
 
@@ -46,83 +44,6 @@ def test_searchable_text_includes_aliases():
 def test_searchable_text_no_aliases_backcompat():
     # Old 3-arg calls still work (aliases optional).
     assert build_searchable_text("N", None, {}) == "N"
-
-
-# ---- dynamic schema parsing (schema.py) ----
-
-def test_parse_node_fields():
-    assert schema_mod._parse_node_fields('[{"name":"title"},{"name":"age"}]') == [
-        "title",
-        "age",
-    ]
-    assert schema_mod._parse_node_fields("") == []
-    assert schema_mod._parse_node_fields("not json") == []
-
-
-def test_parse_edge_endpoints():
-    got = schema_mod._parse_edge_endpoints('[{"endpoints":[["Person","Organization"]]}]')
-    assert got == [("Person", "Organization")]
-    # bad/empty -> permissive default
-    assert schema_mod._parse_edge_endpoints("") == [("*", "*")]
-
-
-def test_load_types_falls_back_to_seed_when_db_down(monkeypatch):
-    # session_scope raising forces the seed fallback path.
-    def _boom():
-        raise RuntimeError("no db")
-
-    monkeypatch.setattr(schema_mod, "session_scope", _boom)
-    monkeypatch.setattr(
-        schema_mod, "get_settings", lambda: _FakeSettings()
-    )
-    nodes, edges = schema_mod.load_types_from_db()
-    assert {t.name for t in nodes} == {n.name for n in schema_mod.SEED_NODE_TYPES}
-    assert {e.name for e in edges} == {e.name for e in schema_mod.SEED_EDGE_TYPES}
-
-
-def test_edge_endpoints_ok_uses_active_schema(monkeypatch):
-    monkeypatch.setattr(
-        schema_mod,
-        "load_types_from_db",
-        lambda: (list(schema_mod.SEED_NODE_TYPES), list(schema_mod.SEED_EDGE_TYPES)),
-    )
-    assert schema_mod.edge_endpoints_ok("works_for", "Person", "Organization")
-    assert not schema_mod.edge_endpoints_ok("works_for", "Organization", "Person")
-    assert schema_mod.edge_endpoints_ok("related_to", "Person", "Concept")  # wildcard
-    assert not schema_mod.edge_endpoints_ok("unknown_label", "Person", "Person")
-
-
-# ---- dynamic extract: new types pending vs dropped ----
-
-def test_validate_drops_unknown_type_when_static(monkeypatch):
-    monkeypatch.setattr(
-        extract_mod, "get_settings", lambda: _FakeSettings(schema_dynamic=False)
-    )
-    monkeypatch.setattr(
-        extract_mod,
-        "load_types_from_db",
-        lambda: (list(schema_mod.SEED_NODE_TYPES), list(schema_mod.SEED_EDGE_TYPES)),
-    )
-    payload = {"nodes": [{"name": "Rust", "type": "Language"}], "edges": []}
-    res = extract_mod.validate("d", payload)
-    assert res.nodes == []
-    assert res.pending_node_types == set()
-    assert any("bad type" in d for d in res.dropped)
-
-
-def test_validate_keeps_unknown_type_when_dynamic(monkeypatch):
-    monkeypatch.setattr(
-        extract_mod, "get_settings", lambda: _FakeSettings(schema_dynamic=True)
-    )
-    monkeypatch.setattr(
-        extract_mod,
-        "load_types_from_db",
-        lambda: (list(schema_mod.SEED_NODE_TYPES), list(schema_mod.SEED_EDGE_TYPES)),
-    )
-    payload = {"nodes": [{"name": "Rust", "type": "Language"}], "edges": []}
-    res = extract_mod.validate("d", payload)
-    assert len(res.nodes) == 1
-    assert "Language" in res.pending_node_types
 
 
 # ---- judge parsing (resolve.py) ----
@@ -303,10 +224,9 @@ def test_merge_dedups_colliding_edge(monkeypatch):
 # ---- fakes / fixtures ----
 
 class _FakeSettings:
-    def __init__(self, schema_dynamic=False):
+    def __init__(self):
         self.graph_no = "default"
         self.graph_version = 1
-        self.schema_dynamic = schema_dynamic
         self.resolve_candidate_topk = 10
         self.resolve_min_score_embedding = 0.0
         self.min_score_text = 0.0

@@ -42,7 +42,7 @@
 | V3 | 全混合召回：FULLTEXT(ngram) + 向量 cosine + RRF + 10 步召回 + Ref 取原文 | ✅ 已交付 |
 | V4 | 可切换搜索后端 + doc chunk + 多 query + 多跳 + 重试阶梯 + URL 接入 | ✅ 已交付 |
 | V5 | 实体对齐与融合 + 半动态 schema | ✅ 核心已交付（代码源后移） |
-| V6 | 版本化 + 规模化 pipeline + Agent 接口(REST/MCP) + UI | 🟡 V6.1 已交付 |
+| V6 | 版本化 + 规模化 pipeline + Agent 接口(REST/MCP) + UI | 🟡 V6.2 已交付 |
 | V7 | 高级能力（多租户 / schema 演化 / 图算法 / 图库迁移） | 🔴 可选 |
 
 ---
@@ -237,14 +237,25 @@ new_entity:
 - 中断留下的 `BUILDING` 版本可续跑；无变化默认不制造空版本。
 - 图谱选择改为请求/任务级 `GraphContext`，为并发 REST/MCP 和 worker 消除进程环境变量竞争。
 
-下一阶段为 V6.2：任务表、异步 worker、逐文档 checkpoint、进度观测和失败重试。
+### V6.2 — 持久化后台 Pipeline ✅
+
+- `kg_task / kg_pipeline_run / kg_pipeline_step` 分别记录任务、版本构建运行和逐文档 checkpoint。
+- 同图谱活动任务通过 `active_key` 去重；worker 使用行锁原子认领，支持多 worker 竞争。
+- 文档开始、成功、跳过、失败均独立提交 checkpoint；重试时已持久化文档由 `kg_doc.sha256` 跳过，不重复调用 LLM。
+- 版本投影使用 `kg_graph.projection_done` 独立 checkpoint，覆盖“全部文档都变化、投影不产生 doc”的空投影续跑边界。
+- 自动重试带预算和延迟；耗尽后进入 `FAILED`，可通过 `retry-task` 人工恢复并保留成功步骤。
+- worker lease 过期自动回收，异常退出后任务可重新入队续跑。
+- `task-status / list-tasks` 提供任务、run、文档步骤三级进度与错误观测。
+- MySQL 保存权威状态；Redis 是可选唤醒队列，失败时回退数据库轮询，并与 RediSearch 分 DB/实例。
+
+下一阶段为 V6.3：抽出 service 层并提供 REST API / MCP server。
 
 ### 功能范围
 
 ```
 Pipeline:
-- 异步 ingest / extraction / indexing
-- 进度可观测、失败重试、checkpoint、增量更新
+- ✅ 后台 ingest / extraction / indexing
+- ✅ 进度可观测、失败重试、checkpoint、增量更新
 
 API:
 - REST API
@@ -273,14 +284,15 @@ UI:
 
 ### V6 基建
 
-- **Redis**：任务队列 / 进度 / checkpoint（与向量索引**分库或分实例**，避免资源竞争与驱逐）
-- 任务表：`kg_task` / `kg_pipeline_run` / `kg_pipeline_step`（参考 `sync_job.go`）
-- Cron：增量扫描、失败任务恢复、索引补偿
+- ✅ **Redis**：可选任务唤醒队列，与向量索引**分库或分实例**；权威状态仍在 MySQL
+- ✅ 任务表：`kg_task` / `kg_pipeline_run` / `kg_pipeline_step`（参考 `sync_job.go`）
+- ✅ worker lease：失败任务恢复和 checkpoint 续跑
+- Cron：定时增量扫描、周期索引补偿（后续运维增强）
 
 ### V6 验收标准
 
-1. 大批文档可后台处理，失败可重试、可断点续跑
-2. 搜索结果可解释（seeds / 邻居 / 多跳路径 / 证据来源）
+1. ✅ 大批文档可后台处理，失败可重试、可断点续跑
+2. 🟡 已返回 seeds / 邻居 / 证据来源；session 路径日志留待 V6.3
 3. Agent 可通过 REST / MCP 调用召回
 4. 图可视化能辅助人工修正实体/边
 

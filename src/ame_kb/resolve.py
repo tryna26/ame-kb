@@ -21,17 +21,17 @@ from dataclasses import dataclass, field
 from importlib import resources
 from typing import Dict, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .db import session_scope
 from .embed import embed_query, embedding_available
 from .extract import _extract_json, call_llm
-from .models import EntityAlias, GraphEdge, GraphNode, MergeLog
+from .models import DomainEntity, EntityAlias, GraphEdge, GraphNode, MergeLog
 from .searchbackend import SearchFilters, get_index
 from .searchindex import NODE, aliases_for, build_searchable_text
-from .store import edge_no, merge_props, merge_ref_maps
+from .store import edge_no, load_domain_map, merge_props, merge_ref_maps
 
 logger = logging.getLogger(__name__)
 
@@ -146,16 +146,48 @@ def find_candidates(
     return rows
 
 
-def _node_snapshot(node: GraphNode) -> Dict:
+def _node_snapshot(
+    node: GraphNode, domain: Optional[tuple] = None
+) -> Dict:
+    dtype, dspec = domain if domain else ("", None)
     return {
         "graph_node_no": node.graph_node_no,
         "name": node.name,
-        "type": node.type,
+        "type": dtype,
+        "entity_spec": dspec,
         "description": node.description,
         "properties": node.properties or {},
         "ref": node.ref or {},
         "deleted": node.deleted,
     }
+
+
+def _domain_of(session: Session, settings, node_no_: str) -> tuple:
+    """Return (type, entity_spec) for a node from the domain layer, or ('', None)."""
+    dm = load_domain_map(
+        session, settings.graph_no, settings.graph_version, [node_no_]
+    )
+    return dm.get(node_no_, ("", None))
+
+
+def _set_domain_deleted(session: Session, settings, node_no_: str, deleted: int) -> None:
+    session.execute(
+        DomainEntity.__table__.update()
+        .where(
+            DomainEntity.graph_no == settings.graph_no,
+            DomainEntity.graph_version == settings.graph_version,
+            DomainEntity.graph_node_no == node_no_,
+        )
+        .values(deleted=deleted)
+    )
+
+
+def _soft_delete_domain(session: Session, settings, node_no_: str) -> None:
+    _set_domain_deleted(session, settings, node_no_, 1)
+
+
+def _restore_domain(session: Session, settings, node_no_: str) -> None:
+    _set_domain_deleted(session, settings, node_no_, 0)
 
 
 def _reindex_node(session: Session, node: GraphNode) -> None:
@@ -286,8 +318,12 @@ def merge(winner_no: str, loser_no: str, *, canonical_name: str = "") -> str:
             raise ValueError(f"merge needs two live nodes: {winner_no}, {loser_no}")
 
         snapshot: Dict = {
-            "winner": _node_snapshot(winner),
-            "loser": _node_snapshot(loser),
+            "winner": _node_snapshot(
+                winner, _domain_of(session, settings, winner_no)
+            ),
+            "loser": _node_snapshot(
+                loser, _domain_of(session, settings, loser_no)
+            ),
             "aliases_added": [],
             "winner_name_changed": False,
             "edges": [],
@@ -315,6 +351,7 @@ def merge(winner_no: str, loser_no: str, *, canonical_name: str = "") -> str:
         # Remap edges, then soft-delete the loser and drop it from the index.
         snapshot["edges"] = _remap_edges(session, settings, winner_no, loser_no)
         loser.deleted = 1
+        _soft_delete_domain(session, settings, loser_no)
         get_index().delete_objects(NODE, [loser_no], session=session)
 
         _reindex_node(session, winner)
@@ -369,6 +406,7 @@ def rollback(merge_id: str) -> None:
         loser.properties = lo.get("properties") or {}
         loser.ref = lo.get("ref") or {}
         loser.deleted = 0
+        _restore_domain(session, settings, log.loser_node_no)
 
         # Reverse edge changes (order does not matter; each keyed by DB id).
         _rollback_edges(session, settings, snap.get("edges", []))
@@ -514,14 +552,26 @@ def resolve_all(
             GraphNode.deleted == 0,
         ]
         if type_filter:
-            conds.append(GraphNode.type == type_filter)
-        node_nos = (
-            session.execute(
+            # The ontology class lives in the domain layer; filter via a join on
+            # the shared graph_node_no.
+            stmt = (
+                select(GraphNode.graph_node_no)
+                .join(
+                    DomainEntity,
+                    and_(
+                        DomainEntity.graph_no == GraphNode.graph_no,
+                        DomainEntity.graph_version == GraphNode.graph_version,
+                        DomainEntity.graph_node_no == GraphNode.graph_node_no,
+                    ),
+                )
+                .where(*conds, DomainEntity.type == type_filter)
+                .order_by(GraphNode.id)
+            )
+        else:
+            stmt = (
                 select(GraphNode.graph_node_no).where(*conds).order_by(GraphNode.id)
             )
-            .scalars()
-            .all()
-        )
+        node_nos = session.execute(stmt).scalars().all()
 
     # Union-find over node_nos. The set representative is always the member that
     # appears earliest in scan order (smallest GraphNode.id), so find(x) yields
@@ -562,9 +612,17 @@ def resolve_all(
             if node is None:
                 continue
             candidates = find_candidates(session, node, limit)
-            node_view = _node_snapshot(node)
+            cand_nos = [c.graph_node_no for c in candidates]
+            domain_map = load_domain_map(
+                session,
+                settings.graph_no,
+                settings.graph_version,
+                [nno] + cand_nos,
+            )
+            node_view = _node_snapshot(node, domain_map.get(nno))
             cand_views = [
-                (c.graph_node_no, _node_snapshot(c)) for c in candidates
+                (c.graph_node_no, _node_snapshot(c, domain_map.get(c.graph_node_no)))
+                for c in candidates
             ]
         for cand_no, cand_view in cand_views:
             # Skip candidates already absorbed as a loser, already in the same

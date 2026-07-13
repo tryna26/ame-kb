@@ -34,6 +34,7 @@ from .models import DocChunk, DocLine, GraphEdge, GraphNode
 from .queryexpand import expand_queries
 from .rrf import rrf_merge
 from .searchbackend import SearchFilters, get_index
+from .store import load_domain_map
 from .vecmath import cosine  # noqa: F401  (re-exported for tests/back-compat)
 
 NODE = "NODE"
@@ -47,6 +48,7 @@ class NodeResult:
     graph_node_no: str
     name: str
     type: str
+    entity_spec: Optional[str]
     description: Optional[str]
     properties: dict
     ref: dict
@@ -246,11 +248,17 @@ def _one_hop_edges(session: Session, node_nos: Sequence[str]) -> List[GraphEdge]
     )
 
 
-def _node_result(n: GraphNode) -> NodeResult:
+def _node_result(
+    n: GraphNode, domain: Optional[Tuple[str, Optional[str]]] = None
+) -> NodeResult:
+    # n.type is the structural role ("ENTITY"); the ontology class + archetype
+    # come from the domain layer (joined by graph_node_no).
+    dtype, dspec = domain if domain else (n.type, None)
     return NodeResult(
         graph_node_no=n.graph_node_no,
         name=n.name,
-        type=n.type,
+        type=dtype,
+        entity_spec=dspec,
         description=n.description,
         properties=n.properties or {},
         ref=n.ref or {},
@@ -573,9 +581,6 @@ def recall(query: str, window: int = 0) -> RecallResult:
         # Step 5: topK seeds.
         seed_nos = ordered_pool[:top_k]
         seed_nodes = _load_nodes(session, seed_nos)
-        result.seeds = [
-            _node_result(seed_nodes[no]) for no in seed_nos if no in seed_nodes
-        ]
 
         # Steps 6-8: bounded multi-hop neighbor expansion (visited-set, gap
         # driven). At RECALL_MAX_HOPS=1 this is exactly V3's one-hop rerank.
@@ -589,8 +594,22 @@ def recall(query: str, window: int = 0) -> RecallResult:
             settings.recall_max_hops,
             result.warnings,
         )
+
+        # Join the domain layer to surface the ontology class + archetype for all
+        # returned nodes (kg_graph_node.type is only the structural role).
+        domain_map = load_domain_map(
+            session,
+            settings.graph_no,
+            settings.graph_version,
+            list(seed_nodes.keys()) + list(neighbor_nodes.keys()),
+        )
+        result.seeds = [
+            _node_result(seed_nodes[no], domain_map.get(no))
+            for no in seed_nos
+            if no in seed_nodes
+        ]
         result.neighbors = [
-            _node_result(neighbor_nodes[no])
+            _node_result(neighbor_nodes[no], domain_map.get(no))
             for no in neighbor_nos
             if no in neighbor_nodes
         ]

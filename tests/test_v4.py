@@ -157,6 +157,7 @@ class _FakeNode:
         self.graph_node_no = no
         self.name = no
         self.type = "Concept"
+        self.entity_spec = None
         self.description = None
         self.properties = {}
         self.ref = {}

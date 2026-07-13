@@ -10,7 +10,8 @@ build_next_version is the orchestrator:
   3. _project the UNCHANGED slice from base to target: nodes/edges whose ref
      survives the doc filter, their kg_search_index rows (WITH embeddings, so
      nothing is re-embedded), the docs' kg_doc/kg_doc_line/kg_doc_chunk (+ their
-     DOC_CHUNK index rows), kg_domain_entity, and surviving kg_entity_alias.
+     DOC_CHUNK index rows), the per-node kg_domain_entity rows, and surviving
+     kg_entity_alias.
   4. extract CHANGED + NEW files into the target version (the only LLM calls).
   5. Flip target -> ACTIVE and base -> FROZEN.
 
@@ -22,7 +23,7 @@ nothing is re-embedded on either backend.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Protocol, Set, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -74,6 +75,22 @@ class BuildResult:
     extracted_docs: int = 0
     skipped: bool = False  # True when a no-op ingest left the version untouched
     warnings: List[str] = field(default_factory=list)
+
+
+class BuildObserver(Protocol):
+    """Durable per-document checkpoint callbacks used by the V6.2 worker."""
+
+    def doc_started(self, doc_no: str) -> None:
+        ...
+
+    def doc_succeeded(self, doc_no: str) -> None:
+        ...
+
+    def doc_skipped(self, doc_no: str) -> None:
+        ...
+
+    def doc_failed(self, doc_no: str, error: Exception) -> None:
+        ...
 
 
 def classify(manifest_hashes: Dict[str, str], base_hashes: Dict[str, str]) -> Classification:
@@ -336,31 +353,33 @@ def _project(
     _copy_index_rows(session, graph_no, base_v, target_v, NODE, kept_node_nos)
     _copy_index_rows(session, graph_no, base_v, target_v, EDGE, kept_edge_nos)
 
-    # Domain entities (whole schema layer) copied verbatim.
-    entities = (
-        session.execute(
-            select(DomainEntity).where(
-                DomainEntity.graph_no == graph_no,
-                DomainEntity.graph_version == base_v,
-                DomainEntity.deleted == 0,
+    # Domain entities: one instance per surviving node, joined by graph_node_no.
+    if kept_node_nos:
+        entities = (
+            session.execute(
+                select(DomainEntity).where(
+                    DomainEntity.graph_no == graph_no,
+                    DomainEntity.graph_version == base_v,
+                    DomainEntity.deleted == 0,
+                    DomainEntity.graph_node_no.in_(list(kept_node_nos)),
+                )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    for de in entities:
-        session.add(
-            DomainEntity(
-                entity_name=de.entity_name,
-                cn_name=de.cn_name,
-                entity_type=de.entity_type,
-                description=de.description,
-                core_schema=de.core_schema,
-                graph_no=graph_no,
-                graph_version=target_v,
-                deleted=0,
+        for de in entities:
+            session.add(
+                DomainEntity(
+                    graph_no=graph_no,
+                    graph_version=target_v,
+                    graph_node_no=de.graph_node_no,
+                    name=de.name,
+                    type=de.type,
+                    entity_spec=de.entity_spec,
+                    properties=de.properties,
+                    deleted=0,
+                )
             )
-        )
 
     # Aliases pointing at a surviving node.
     aliases = (
@@ -438,6 +457,7 @@ def build_next_version(
     force: bool = False,
     allow_empty: bool = False,
     dry_run: bool = False,
+    observer: Optional[BuildObserver] = None,
 ) -> BuildResult:
     """Assemble the next version of `graph_no` from its manifest `files`."""
     docs, manifest_hashes, load_warnings = _load_manifest_docs(files)
@@ -489,17 +509,24 @@ def build_next_version(
         else:
             row.status = "BUILDING"
 
-    # Project the unchanged slice (only when deriving a new version and not
-    # already projected by a previous, interrupted run).
+    # Project the unchanged slice once. An explicit checkpoint is required:
+    # when every document changed, a successful projection creates no kg_doc
+    # rows, so _has_docs cannot distinguish "done, empty" from "not started".
     if is_new_version:
         with session_scope() as session:
-            already = _has_docs(session, graph_no, target_v)
-            if not already:
+            target_row = session.execute(
+                select(Graph).where(
+                    Graph.graph_no == graph_no,
+                    Graph.graph_version == target_v,
+                )
+            ).scalar_one()
+            if not target_row.projection_done:
                 pn, pe = _project(
                     session, graph_no, base_v, target_v, set(cls.unchanged)
                 )
                 result.projected_nodes = pn
                 result.projected_edges = pe
+                target_row.projection_done = 1
 
     # Extract changed + new files into the target version.
     with graph_context(graph_no, target_v):
@@ -507,12 +534,30 @@ def build_next_version(
             doc = docs.get(doc_no)
             if doc is None:
                 continue
-            if not force and store_mod.is_unchanged(doc):
+            try:
+                unchanged = not force and store_mod.is_unchanged(doc)
+            except Exception as exc:
+                if observer is not None:
+                    observer.doc_started(doc_no)
+                    observer.doc_failed(doc_no, exc)
+                raise
+            if unchanged:
+                if observer is not None:
+                    observer.doc_skipped(doc_no)
                 continue  # already persisted by an interrupted run (resume)
-            ext = extract_mod.extract(doc)
-            store_mod.store(ext)
-            ingest_mod.persist_doc(doc)
-            result.extracted_docs += 1
+            if observer is not None:
+                observer.doc_started(doc_no)
+            try:
+                ext = extract_mod.extract(doc)
+                store_mod.store(ext)
+                ingest_mod.persist_doc(doc)
+                result.extracted_docs += 1
+            except Exception as exc:
+                if observer is not None:
+                    observer.doc_failed(doc_no, exc)
+                raise
+            if observer is not None:
+                observer.doc_succeeded(doc_no)
 
     # Finalize: target ACTIVE, base FROZEN.
     with session_scope() as session:

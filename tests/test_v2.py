@@ -40,7 +40,8 @@ def test_validate_keeps_extra_properties():
         "nodes": [
             {
                 "name": "Ada",
-                "type": "Person",
+                "entity_type": "Asset",
+                "entity_spec": "Artifact",
                 "properties": {"title": "x", "birth_year": 1815},
                 "source": ["1-1"],
             }
@@ -56,9 +57,9 @@ def test_validate_keeps_extra_properties():
 def test_validate_edge_confidence_default_and_gate():
     payload = {
         "nodes": [
-            {"name": "Ada", "type": "Person", "source": ["1-1"]},
-            {"name": "ACME", "type": "Organization", "source": ["2-2"]},
-            {"name": "Doc", "type": "Document", "source": ["3-3"]},
+            {"name": "Ada", "entity_type": "Asset", "entity_spec": "Mission", "source": ["1-1"]},
+            {"name": "ACME", "entity_type": "Relation", "source": ["2-2"]},
+            {"name": "Doc", "entity_type": "Asset", "entity_spec": "Implementation", "source": ["3-3"]},
         ],
         "edges": [
             # no confidence -> default INFERRED, kept

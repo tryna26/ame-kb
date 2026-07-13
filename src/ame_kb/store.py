@@ -1,8 +1,14 @@
-"""Persist extraction results into kg_graph_node / kg_graph_edge.
+"""Persist extraction results into kg_graph_node / kg_graph_edge / kg_domain_entity.
 
-Dedup strategy (V1): graph_node_no = "type:slug(name)" so exact same-name
-entities collide on the UNIQUE key and are merged via upsert. This is the
-simplest seed of the V3 resolution step, at zero cost.
+Two-layer model: kg_graph_node is the structural layer (type always "ENTITY"),
+kg_domain_entity is the domain instance layer (type = ontology class
+Asset/Relation/Event/Behavior, entity_spec = Asset archetype). Both rows share
+graph_node_no as the join key.
+
+Dedup strategy: graph_node_no = "type:spec:slug(name)" for Asset nodes (spec is
+the archetype) and "type:slug(name)" otherwise, so the same real entity in the
+same ontology layer collides on the UNIQUE key and is merged via upsert. This is
+the simplest seed of the V3 resolution step, at zero cost.
 
 V3: nodes/edges also carry a `description`; after upsert we refresh the
 kg_search_index rows (searchable_text + embedding) so hybrid recall stays in
@@ -14,17 +20,21 @@ import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .db import session_scope
 from .extract import ExtractionResult
 from .ingest import Document
-from .models import Doc, GraphEdge, GraphNode
-from .schema import register_type
+from .models import Doc, DomainEntity, GraphEdge, GraphNode
 from .searchindex import EDGE, NODE, build_searchable_text, upsert_search_index
+
+# Structural role written to kg_graph_node.type; the ontology class lives in the
+# domain layer (kg_domain_entity.type).
+STRUCTURAL_ROLE = "ENTITY"
 
 
 @dataclass
@@ -60,13 +70,78 @@ def slug(name: str) -> str:
     return norm or "unnamed"
 
 
-def node_no(type_: str, name: str) -> str:
-    return f"{type_}:{slug(name)}"
+def node_no(entity_type: str, entity_spec: Optional[str], name: str) -> str:
+    prefix = f"{entity_type}:{entity_spec}" if entity_spec else entity_type
+    return f"{prefix}:{slug(name)}"
 
 
 def edge_no(source_no: str, label: str, target_no: str) -> str:
     key = f"{source_no}|{label}|{target_no}"
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+
+def _upsert_domain_entity(
+    session: Session,
+    graph_no: str,
+    graph_version: int,
+    nno: str,
+    name: str,
+    entity_type: str,
+    entity_spec: Optional[str],
+    properties: Optional[Dict],
+) -> None:
+    """Mirror a structural node into the domain instance layer (same node_no)."""
+    existing = session.execute(
+        select(DomainEntity).where(
+            DomainEntity.graph_no == graph_no,
+            DomainEntity.graph_version == graph_version,
+            DomainEntity.graph_node_no == nno,
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        session.add(
+            DomainEntity(
+                graph_no=graph_no,
+                graph_version=graph_version,
+                graph_node_no=nno,
+                name=name,
+                type=entity_type,
+                entity_spec=entity_spec,
+                properties=properties or {},
+            )
+        )
+    else:
+        existing.name = name
+        existing.type = entity_type
+        existing.entity_spec = entity_spec
+        existing.properties = properties or {}
+        existing.deleted = 0
+
+
+def load_domain_map(
+    session: Session,
+    graph_no: str,
+    graph_version: int,
+    node_nos: List[str],
+) -> Dict[str, Tuple[str, Optional[str]]]:
+    """Batch-load {graph_node_no: (type, entity_spec)} for the given nodes.
+
+    Used by read paths (recall/query) to surface the ontology class + archetype,
+    since kg_graph_node.type is now the structural role ("ENTITY").
+    """
+    if not node_nos:
+        return {}
+    rows = session.execute(
+        select(
+            DomainEntity.graph_node_no, DomainEntity.type, DomainEntity.entity_spec
+        ).where(
+            DomainEntity.graph_no == graph_no,
+            DomainEntity.graph_version == graph_version,
+            DomainEntity.graph_node_no.in_(list(node_nos)),
+            DomainEntity.deleted == 0,
+        )
+    ).all()
+    return {r[0]: (r[1], r[2]) for r in rows}
 
 
 def _merge_ref(existing: Dict, doc_id: str, lines: List[str]) -> Dict:
@@ -96,17 +171,12 @@ def merge_props(winner: Dict, loser: Dict) -> Dict:
 def store(result: ExtractionResult) -> StoreStats:
     settings = get_settings()
     stats = StoreStats()
-    # V5: register any LLM-proposed new node types before persisting (only when
-    # SCHEMA_DYNAMIC is on; validate() leaves pending_node_types empty otherwise).
-    if result.pending_node_types:
-        for t in sorted(result.pending_node_types):
-            register_type("Node", t, description="(dynamic) LLM-proposed type")
     with session_scope() as session:
         name_to_no: Dict[str, str] = {}
         index_entries: List[Dict] = []
 
         for node in result.nodes:
-            nno = node_no(node.type, node.name)
+            nno = node_no(node.entity_type, node.entity_spec, node.name)
             existing = session.execute(
                 select(GraphNode).where(
                     GraphNode.graph_no == settings.graph_no,
@@ -131,7 +201,7 @@ def store(result: ExtractionResult) -> StoreStats:
                         graph_version=settings.graph_version,
                         graph_node_no=nno,
                         name=node.name,
-                        type=node.type,
+                        type=STRUCTURAL_ROLE,
                         description=description,
                         properties=merged_props,
                         ref=_merge_ref({}, result.doc_id, node.source),
@@ -147,6 +217,16 @@ def store(result: ExtractionResult) -> StoreStats:
                 description = existing.description
                 existing.ref = _merge_ref(existing.ref, result.doc_id, node.source)
                 stats.nodes_updated += 1
+            _upsert_domain_entity(
+                session,
+                settings.graph_no,
+                settings.graph_version,
+                nno,
+                node.name,
+                node.entity_type,
+                node.entity_spec,
+                merged_props,
+            )
             index_entries.append(
                 {
                     "object_type": NODE,

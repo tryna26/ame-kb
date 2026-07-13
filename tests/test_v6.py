@@ -224,12 +224,12 @@ def _seed_v1(Session):
                            content=doc_no + " chunk", sha256="h_" + doc_no))
         s.add_all([
             GraphNode(graph_no="g1", graph_version=1, graph_node_no="N:shared",
-                      name="Shared", type="Concept", properties={},
+                      name="Shared", type="ENTITY", properties={},
                       ref={"d1": ["1"], "d2": ["1"]}),
             GraphNode(graph_no="g1", graph_version=1, graph_node_no="N:only1",
-                      name="Only1", type="Concept", properties={}, ref={"d1": ["1"]}),
+                      name="Only1", type="ENTITY", properties={}, ref={"d1": ["1"]}),
             GraphNode(graph_no="g1", graph_version=1, graph_node_no="N:only2",
-                      name="Only2", type="Concept", properties={}, ref={"d2": ["1"]}),
+                      name="Only2", type="ENTITY", properties={}, ref={"d2": ["1"]}),
         ])
         s.add(GraphEdge(graph_no="g1", graph_version=1, graph_edge_no="E:1",
                         source_node_no="N:only1", target_node_no="N:shared",
@@ -244,8 +244,11 @@ def _seed_v1(Session):
             s.add(SearchIndex(graph_no="g1", graph_version=1, object_type=DOC_CHUNK,
                               object_no="chunk_" + doc_no, searchable_text="c",
                               embedding=[0.4]))
-        s.add(DomainEntity(graph_no="g1", graph_version=1, entity_name="Concept",
-                           entity_type="Node", core_schema="[]"))
+        # Domain instance layer: one row per node (joined by graph_node_no).
+        for no, nm in (("N:shared", "Shared"), ("N:only1", "Only1"),
+                       ("N:only2", "Only2")):
+            s.add(DomainEntity(graph_no="g1", graph_version=1, graph_node_no=no,
+                               name=nm, type="Asset", entity_spec="Solution"))
         s.add(EntityAlias(graph_no="g1", graph_version=1,
                           canonical_node_no="N:shared", alias="共享"))
         s.commit()
@@ -288,9 +291,11 @@ def test_project_shares_and_drops(monkeypatch):
         docs = {d.doc_no for d in s.execute(
             select(Doc).where(Doc.graph_version == 2)).scalars()}
         assert docs == {"d1"}
-        # schema layer + surviving alias copied
-        assert s.execute(select(DomainEntity).where(
-            DomainEntity.graph_version == 2)).scalars().first() is not None
+        # domain instances copied only for surviving nodes; alias copied
+        domain_nos = {d.graph_node_no for d in s.execute(
+            select(DomainEntity).where(
+                DomainEntity.graph_version == 2)).scalars()}
+        assert domain_nos == {"N:shared", "N:only1"}  # N:only2 dropped
         assert s.execute(select(EntityAlias).where(
             EntityAlias.graph_version == 2)).scalar_one().alias == "共享"
 
@@ -372,15 +377,93 @@ def test_build_only_extracts_changed_and_new(monkeypatch, tmp_path):
         _mf("d2", "d2.md", "d2x", tmp_path),  # hash h_d2x != h_d2  -> changed
         _mf("d3", "d3.md", "d3", tmp_path),   # not in base         -> new
     ]
-    res = versioning_mod.build_next_version("g1", files)
+    events = []
+
+    class _Observer:
+        def doc_started(self, doc_no):
+            events.append(("started", doc_no))
+
+        def doc_succeeded(self, doc_no):
+            events.append(("succeeded", doc_no))
+
+        def doc_skipped(self, doc_no):
+            events.append(("skipped", doc_no))
+
+        def doc_failed(self, doc_no, error):
+            events.append(("failed", doc_no))
+
+    res = versioning_mod.build_next_version("g1", files, observer=_Observer())
     assert res.base_version == 1 and res.target_version == 2
     assert sorted(calls) == ["d2", "d3"]  # d1 NOT re-extracted
+    assert events == [
+        ("started", "d2"),
+        ("succeeded", "d2"),
+        ("started", "d3"),
+        ("succeeded", "d3"),
+    ]
     assert res.projected_nodes >= 1
     with Session() as s:
         v2 = s.execute(select(Graph).where(Graph.graph_version == 2)).scalar_one()
         v1 = s.execute(select(Graph).where(Graph.graph_version == 1)).scalar_one()
         assert v2.status == "ACTIVE"
         assert v1.status == "FROZEN"
+
+
+def test_empty_projection_checkpoint_is_not_repeated_on_resume(monkeypatch, tmp_path):
+    """All-changed builds copy no docs, but projection still needs a checkpoint."""
+
+    from ame_kb.extract import ExtractionResult
+
+    Session = _sqlite_session_factory()
+    _seed_v1(Session)
+    monkeypatch.setattr(versioning_mod, "session_scope", _scope_factory(Session))
+    _use_mysql_index(monkeypatch)
+    monkeypatch.setattr(
+        versioning_mod.store_mod, "content_hash", lambda text: "h_" + text.strip()
+    )
+    monkeypatch.setattr(versioning_mod.store_mod, "is_unchanged", lambda doc: False)
+    monkeypatch.setattr(versioning_mod.store_mod, "store", lambda result: None)
+    monkeypatch.setattr(versioning_mod.ingest_mod, "persist_doc", lambda doc: None)
+
+    calls = {"n": 0}
+
+    def _extract(doc):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("interrupted after empty projection")
+        return ExtractionResult(doc_id=doc.doc_id)
+
+    monkeypatch.setattr(versioning_mod.extract_mod, "extract", _extract)
+    files = [
+        _mf("d1", "d1.md", "d1_changed", tmp_path),
+        _mf("d2", "d2.md", "d2_changed", tmp_path),
+    ]
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        versioning_mod.build_next_version("g1", files)
+    with Session() as session:
+        v2 = session.execute(
+            select(Graph).where(Graph.graph_no == "g1", Graph.graph_version == 2)
+        ).scalar_one()
+        assert v2.status == "BUILDING"
+        assert v2.projection_done == 1
+
+    versioning_mod.build_next_version("g1", files)
+    with Session() as session:
+        # All docs changed -> nothing projected; extraction is stubbed to store
+        # nothing, so v2 has no inherited domain rows.
+        schemas = session.execute(
+            select(DomainEntity).where(
+                DomainEntity.graph_no == "g1",
+                DomainEntity.graph_version == 2,
+            )
+        ).scalars().all()
+        assert len(schemas) == 0
+        assert session.execute(
+            select(Graph.status).where(
+                Graph.graph_no == "g1", Graph.graph_version == 2
+            )
+        ).scalar_one() == "ACTIVE"
 
 
 def test_build_skips_when_no_changes(monkeypatch, tmp_path):
@@ -408,4 +491,3 @@ class _Settings:
     graph_no = "g1"
     graph_version = 1
     source_dir = "."
-    schema_dynamic = False
