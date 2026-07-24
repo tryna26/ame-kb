@@ -14,7 +14,7 @@ Auth: if AME_KB_TOKEN is set, it is sent as ``Authorization: Bearer <token>``.
 (The server does not enforce auth yet; this is forward-compatible plumbing.)
 
 Commands:
-  search <query> [--graph NO] [--version N] [--window N] [--no-trace] [--json]
+  search <query> [--graph NO] [--version N] [--window N] [--state-id ID] [--no-trace] [--json]
   ingest <graph_no> [--force] [--allow-empty]
   tasks  [--graph NO] [--limit N]
   task   <task_no>
@@ -134,6 +134,11 @@ def _render_search(res: dict) -> str:
             f"edges={sess['edge_count']} evidence={sess['evidence_count']} "
             f"doc_chunks={sess['doc_chunk_count']}"
         )
+    if res.get("state_id"):
+        out.append(
+            f"\n# State {res['state_id']}: {res.get('explored_total', 0)} node(s) "
+            "explored so far (rerun with the same --state-id to dig deeper)."
+        )
     return "\n".join(out)
 
 
@@ -148,6 +153,7 @@ def cmd_search(args) -> None:
         "graph_version": args.version,
         "window": args.window,
         "trace": not args.no_trace,
+        "state_id": args.state_id,
     }
     res = _request("POST", f"{base}/search", body)
     if args.json:
@@ -235,6 +241,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--graph", help="graph_no (default: server default graph).")
     s.add_argument("--version", type=int, help="Pin a graph version (default latest).")
     s.add_argument("--window", type=int, default=0, help="±lines around each cited line.")
+    s.add_argument(
+        "--state-id",
+        dest="state_id",
+        help="Progressive exploration: reuse across searches to skip "
+        "already-returned nodes (dig deeper without repeats).",
+    )
     s.add_argument("--no-trace", action="store_true", help="Suppress the session trace.")
     s.add_argument("--json", action="store_true", help="Print raw JSON instead of text.")
     s.set_defaults(func=cmd_search)

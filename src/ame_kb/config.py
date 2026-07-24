@@ -48,9 +48,15 @@ class Settings(BaseModel):
     recall_min_results: int
     retry_strict_text: float
     retry_strict_embedding: float
+    # Stateful progressive exploration (in-process explored-set store).
+    recall_state_ttl_seconds: float
+    recall_state_max_states: int
     # V5: entity fusion (resolve) knobs.
     resolve_candidate_topk: int
     resolve_min_score_embedding: float
+    # V6.5: opt-in low-support pruning.
+    resolve_prune_enabled: bool
+    resolve_prune_min_support: int
     # V6.2: durable pipeline + optional Redis wake-up queue.
     pipeline_queue_backend: str
     pipeline_redis_url: str
@@ -58,6 +64,9 @@ class Settings(BaseModel):
     pipeline_poll_seconds: float
     pipeline_retry_delay_seconds: int
     pipeline_lease_seconds: int
+    # Code ingestion (tree-sitter structural extraction).
+    code_cache_dir: str
+    code_langs: str
 
 
 @dataclass(frozen=True)
@@ -141,10 +150,17 @@ def _base_settings() -> Settings:
         recall_min_results=int(os.getenv("RECALL_MIN_RESULTS", "0")),
         retry_strict_text=float(os.getenv("RETRY_STRICT_TEXT", "0.8")),
         retry_strict_embedding=float(os.getenv("RETRY_STRICT_EMBEDDING", "0.8")),
+        recall_state_ttl_seconds=float(
+            os.getenv("RECALL_STATE_TTL_SECONDS", "1800")
+        ),
+        recall_state_max_states=int(os.getenv("RECALL_STATE_MAX_STATES", "1000")),
         resolve_candidate_topk=int(os.getenv("RESOLVE_CANDIDATE_TOPK", "10")),
         resolve_min_score_embedding=float(
             os.getenv("RESOLVE_MIN_SCORE_EMBEDDING", "0")
         ),
+        resolve_prune_enabled=os.getenv("RESOLVE_PRUNE_ENABLED", "false").lower()
+        in ("1", "true", "yes"),
+        resolve_prune_min_support=int(os.getenv("RESOLVE_PRUNE_MIN_SUPPORT", "2")),
         pipeline_queue_backend=os.getenv("PIPELINE_QUEUE_BACKEND", "database"),
         pipeline_redis_url=os.getenv(
             "PIPELINE_REDIS_URL", "redis://localhost:6379/1"
@@ -155,6 +171,8 @@ def _base_settings() -> Settings:
             os.getenv("PIPELINE_RETRY_DELAY_SECONDS", "5")
         ),
         pipeline_lease_seconds=int(os.getenv("PIPELINE_LEASE_SECONDS", "900")),
+        code_cache_dir=os.getenv("CODE_CACHE_DIR", "~/.ame-kb/code"),
+        code_langs=os.getenv("CODE_LANGS", "python,go"),
     )
 
 

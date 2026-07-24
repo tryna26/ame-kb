@@ -1,5 +1,5 @@
-"""Offline V5 tests: fusion helpers, alias indexing, judge parsing, and
-merge/rollback logic against an in-memory fake session.
+"""Offline V5 tests: fusion helpers, alias indexing, cluster parsing,
+merge/rollback, and low-support pruning against an in-memory fake session.
 No real DB/LLM/embedding calls."""
 import ame_kb.resolve as resolve_mod
 from ame_kb.searchindex import build_searchable_text
@@ -46,37 +46,56 @@ def test_searchable_text_no_aliases_backcompat():
     assert build_searchable_text("N", None, {}) == "N"
 
 
-# ---- judge parsing (resolve.py) ----
+# ---- cluster parsing (resolve.py) ----
 
-def test_judge_parses_same(monkeypatch):
+def test_cluster_parses_group(monkeypatch):
     monkeypatch.setattr(
         resolve_mod,
         "call_llm",
-        lambda p: '{"verdict":"same","canonical_name":"Ada Lovelace","reason":"全名"}',
+        lambda p: '{"clusters":[{"canonical":"Ada Lovelace","names":["Ada","Ada Lovelace"]}]}',
     )
-    out = resolve_mod.judge({"name": "Ada"}, {"name": "Ada Lovelace"})
-    assert out["verdict"] == "same"
-    assert out["canonical_name"] == "Ada Lovelace"
+    out = resolve_mod.cluster(
+        "Person", [{"name": "Ada"}, {"name": "Ada Lovelace"}]
+    )
+    assert len(out) == 1
+    assert out[0]["canonical"] == "Ada Lovelace"
+    assert set(out[0]["names"]) == {"Ada", "Ada Lovelace"}
 
 
-def test_judge_bad_json_is_conservative(monkeypatch):
+def test_cluster_drops_invented_names(monkeypatch):
+    # The model must only reuse names it was given; invented names are dropped,
+    # so a group that shrinks below 2 real names is discarded.
+    monkeypatch.setattr(
+        resolve_mod,
+        "call_llm",
+        lambda p: '{"clusters":[{"canonical":"X","names":["Ada","Ghost"]}]}',
+    )
+    out = resolve_mod.cluster(
+        "Person", [{"name": "Ada"}, {"name": "Bob"}]
+    )
+    assert out == []
+
+
+def test_cluster_bad_json_is_empty(monkeypatch):
     monkeypatch.setattr(resolve_mod, "call_llm", lambda p: "totally not json")
-    out = resolve_mod.judge({"name": "A"}, {"name": "B"})
-    assert out["verdict"] == "different"
+    assert resolve_mod.cluster("Person", [{"name": "A"}, {"name": "B"}]) == []
 
 
-def test_judge_llm_failure_is_conservative(monkeypatch):
+def test_cluster_llm_failure_is_empty(monkeypatch):
     def _boom(p):
         raise RuntimeError("no llm")
 
     monkeypatch.setattr(resolve_mod, "call_llm", _boom)
-    out = resolve_mod.judge({"name": "A"}, {"name": "B"})
-    assert out["verdict"] == "different"
+    assert resolve_mod.cluster("Person", [{"name": "A"}, {"name": "B"}]) == []
 
 
-def test_judge_normalizes_unknown_verdict(monkeypatch):
-    monkeypatch.setattr(resolve_mod, "call_llm", lambda p: '{"verdict":"maybe"}')
-    assert resolve_mod.judge({}, {})["verdict"] == "different"
+def test_cluster_single_entity_short_circuits(monkeypatch):
+    # Fewer than 2 candidates: never calls the LLM.
+    def _boom(p):
+        raise AssertionError("should not call LLM")
+
+    monkeypatch.setattr(resolve_mod, "call_llm", _boom)
+    assert resolve_mod.cluster("Person", [{"name": "Solo"}]) == []
 
 
 # ---- merge + rollback against a real in-memory SQLite DB ----
@@ -221,6 +240,97 @@ def test_merge_dedups_colliding_edge(monkeypatch):
         assert live[0].ref == {"d": ["9"]}  # loser edge's ref folded in
 
 
+# ---- low-support pruning (resolve.py) ----
+
+def test_prune_low_support_drops_orphans_and_rolls_back(monkeypatch):
+    from sqlalchemy import select
+
+    from ame_kb.models import GraphEdge, GraphNode, MergeLog
+
+    Session = _sqlite_session_factory()
+    settings = _FakeSettings()
+    with Session() as s:
+        s.add_all(
+            [
+                # support=1, no edge -> pruned
+                GraphNode(graph_no="default", graph_version=1,
+                          graph_node_no="Person:orphan", name="Orphan",
+                          type="ENTITY", properties={}, ref={"d1": ["1"]}),
+                # support=2 -> kept (enough support)
+                GraphNode(graph_no="default", graph_version=1,
+                          graph_node_no="Person:popular", name="Popular",
+                          type="ENTITY", properties={}, ref={"d1": ["1"], "d2": ["3"]}),
+                # support=1 but edge-referenced -> protected
+                GraphNode(graph_no="default", graph_version=1,
+                          graph_node_no="Person:linked", name="Linked",
+                          type="ENTITY", properties={}, ref={"d1": ["1"]}),
+                GraphNode(graph_no="default", graph_version=1,
+                          graph_node_no="Doc:n", name="N", type="ENTITY",
+                          properties={}, ref={"d1": ["1"], "d2": ["2"]}),
+                GraphEdge(graph_no="default", graph_version=1,
+                          graph_edge_no="e1", source_node_no="Person:linked",
+                          target_node_no="Doc:n", name="in", properties={}, ref={}),
+            ]
+        )
+        s.commit()
+
+    _wire_resolve_sqlite(monkeypatch, Session, settings)
+    stats = resolve_mod.prune_low_support()
+    assert stats.pruned == 1
+
+    with Session() as s:
+        orphan = s.execute(
+            select(GraphNode).where(GraphNode.graph_node_no == "Person:orphan")
+        ).scalar_one()
+        assert orphan.deleted == 1
+        assert s.execute(
+            select(GraphNode).where(GraphNode.graph_node_no == "Person:linked")
+        ).scalar_one().deleted == 0  # protected by edge
+        assert s.execute(
+            select(GraphNode).where(GraphNode.graph_node_no == "Person:popular")
+        ).scalar_one().deleted == 0  # enough support
+        log = s.execute(
+            select(MergeLog).where(MergeLog.status == "PRUNED")
+        ).scalar_one()
+        merge_id = log.merge_id
+        assert log.loser_node_no == "Person:orphan"
+
+    # rollback restores the pruned node.
+    resolve_mod.rollback(merge_id)
+    with Session() as s:
+        assert s.execute(
+            select(GraphNode).where(GraphNode.graph_node_no == "Person:orphan")
+        ).scalar_one().deleted == 0
+        assert s.execute(
+            select(MergeLog).where(MergeLog.merge_id == merge_id)
+        ).scalar_one().status == "ROLLED_BACK"
+
+
+def test_prune_dry_run_writes_nothing(monkeypatch):
+    from sqlalchemy import select
+
+    from ame_kb.models import GraphNode, MergeLog
+
+    Session = _sqlite_session_factory()
+    settings = _FakeSettings()
+    with Session() as s:
+        s.add(
+            GraphNode(graph_no="default", graph_version=1,
+                      graph_node_no="Person:orphan", name="Orphan",
+                      type="ENTITY", properties={}, ref={"d1": ["1"]})
+        )
+        s.commit()
+
+    _wire_resolve_sqlite(monkeypatch, Session, settings)
+    stats = resolve_mod.prune_low_support(dry_run=True)
+    assert stats.pruned == 1
+    with Session() as s:
+        assert s.execute(
+            select(GraphNode).where(GraphNode.graph_node_no == "Person:orphan")
+        ).scalar_one().deleted == 0  # untouched
+        assert s.execute(select(MergeLog)).first() is None
+
+
 # ---- fakes / fixtures ----
 
 class _FakeSettings:
@@ -230,6 +340,8 @@ class _FakeSettings:
         self.resolve_candidate_topk = 10
         self.resolve_min_score_embedding = 0.0
         self.min_score_text = 0.0
+        self.resolve_prune_enabled = False
+        self.resolve_prune_min_support = 2
 
 
 def _sqlite_session_factory():

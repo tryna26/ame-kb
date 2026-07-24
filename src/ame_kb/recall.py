@@ -22,7 +22,7 @@ multi-list fusion and stays separate.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -32,6 +32,7 @@ from .db import session_scope
 from .embed import embed_query, embedding_available
 from .models import DocChunk, DocLine, GraphEdge, GraphNode
 from .queryexpand import expand_queries
+from .recall_state import get_explored, mark_explored, state_key
 from .rrf import rrf_merge
 from .searchbackend import SearchFilters, get_index
 from .store import load_domain_map
@@ -123,6 +124,10 @@ class RecallResult:
     doc_chunks: List[DocChunkHit] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     session: Optional["RecallSession"] = None
+    # Stateful progressive exploration: the state_id used (if any) and the
+    # cumulative number of distinct nodes explored under it so far.
+    state_id: Optional[str] = None
+    explored_total: int = 0
 
 
 def build_candidate_pool(
@@ -498,6 +503,7 @@ def _expand_neighbors(
     max_hops: int,
     warnings: List[str],
     trace: Optional["RecallSession"] = None,
+    exclude: Optional[Set[str]] = None,
 ) -> Tuple[List[str], List[GraphEdge], Dict[str, GraphNode]]:
     """Bounded, gap-driven multi-hop neighbor expansion.
 
@@ -507,10 +513,15 @@ def _expand_neighbors(
     stop early once we already have neighbor_k results (gap-driven), and never
     exceed max_hops. At max_hops=1 this reproduces V3 steps 6-8 exactly.
 
+    `exclude` pre-seeds `visited` with nodes already returned under a caller's
+    state_id, so a stateful follow-up never re-picks them as neighbors (edges are
+    still traversed for context, but excluded nodes are not kept).
+
     Returns (ordered neighbor_nos, all traversed edges, loaded node map).
     """
+    exclude = exclude or set()
     seed_set = set(seed_nos)
-    visited = set(seed_nos)
+    visited = set(seed_nos) | exclude
     frontier: List[str] = list(seed_nos)
     all_edges: List[GraphEdge] = []
     node_cache: Dict[str, GraphNode] = {}
@@ -572,11 +583,29 @@ def _expand_neighbors(
     return neighbor_nos, all_edges, node_cache
 
 
-def recall(query: str, window: int = 0, trace: bool = False) -> RecallResult:
+def recall(
+    query: str,
+    window: int = 0,
+    trace: bool = False,
+    state_id: Optional[str] = None,
+) -> RecallResult:
     settings = get_settings()
     result = RecallResult(query=query)
+    result.state_id = state_id
     session_trace = RecallSession(query=query) if trace else None
     result.session = session_trace
+
+    # Stateful progressive exploration: nodes already returned under this
+    # state_id are excluded from seeds + neighbor expansion, so an agent passing
+    # the same state_id across follow-ups keeps getting new results. The store
+    # key is namespaced by graph so the same state_id reused against a different
+    # graph never cross-excludes nodes (node_nos are unique only within a graph).
+    skey = (
+        state_key(settings.graph_no, settings.graph_version, state_id)
+        if state_id
+        else None
+    )
+    explored = get_explored(skey) if skey else set()
 
     query_embedding = _embed_query(query, result.warnings)
     if session_trace is not None:
@@ -631,8 +660,14 @@ def recall(query: str, window: int = 0, trace: bool = False) -> RecallResult:
         if session_trace is not None:
             session_trace.pool_size = len(ordered_pool)
 
-        # Step 5: topK seeds.
-        seed_nos = ordered_pool[:top_k]
+        # Step 5: topK seeds. Skip nodes already explored under this state_id so
+        # a stateful follow-up surfaces the next-best, not-yet-seen seeds.
+        available = (
+            [no for no in ordered_pool if no not in explored]
+            if explored
+            else ordered_pool
+        )
+        seed_nos = available[:top_k]
         seed_nodes = _load_nodes(session, seed_nos)
 
         # Steps 6-8: bounded multi-hop neighbor expansion (visited-set, gap
@@ -647,6 +682,7 @@ def recall(query: str, window: int = 0, trace: bool = False) -> RecallResult:
             settings.recall_max_hops,
             result.warnings,
             trace=session_trace,
+            exclude=explored,
         )
 
         # Join the domain layer to surface the ontology class + archetype for all
@@ -704,6 +740,12 @@ def recall(query: str, window: int = 0, trace: bool = False) -> RecallResult:
         session_trace.edge_count = len(result.edges)
         session_trace.evidence_count = len(result.evidence)
         session_trace.doc_chunk_count = len(result.doc_chunks)
+
+    # Record the seeds + neighbors returned this call so a follow-up under the
+    # same state_id excludes them (progressive exploration).
+    if skey:
+        returned = [nr.graph_node_no for nr in result.seeds + result.neighbors]
+        result.explored_total = mark_explored(skey, returned)
 
     # Step 10: return.
     return result

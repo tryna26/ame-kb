@@ -12,12 +12,17 @@ module is only imported when the API is actually served.
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import service as service_mod
+
+WEB_DIR = Path(__file__).resolve().parent / "web"
 
 
 class SearchRequest(BaseModel):
@@ -26,6 +31,9 @@ class SearchRequest(BaseModel):
     graph_version: Optional[int] = None
     window: int = 0
     trace: bool = True
+    # Stateful progressive exploration: reuse the same state_id across follow-up
+    # searches to exclude already-returned nodes ("dig deeper" without repeats).
+    state_id: Optional[str] = None
 
 
 class IngestRequest(BaseModel):
@@ -59,8 +67,25 @@ def create_app() -> FastAPI:
             graph_version=req.graph_version,
             window=req.window,
             trace=req.trace,
+            state_id=req.state_id,
         )
         return asdict(res)
+
+    @app.delete("/search/state/{state_id}")
+    def clear_search_state(
+        state_id: str,
+        graph_no: Optional[str] = None,
+        graph_version: Optional[int] = None,
+    ) -> dict:
+        """Forget an exploration state so its next search starts fresh.
+
+        The state is namespaced by graph, so pass the same graph_no /
+        graph_version the search used (omit to use the server default graph).
+        """
+        cleared = service_mod.clear_recall_state(
+            state_id, graph_no=graph_no, graph_version=graph_version
+        )
+        return {"state_id": state_id, "cleared": cleared}
 
     @app.get("/graphs/{graph_no}/entities")
     def entities(
@@ -83,6 +108,15 @@ def create_app() -> FastAPI:
         )
         return [asdict(r) for r in rels]
 
+    @app.get("/graphs/{graph_no}/snapshot")
+    def snapshot(
+        graph_no: str, graph_version: Optional[int] = None, limit: int = 2000
+    ) -> dict:
+        snap = service_mod.graph_snapshot(
+            graph_no=graph_no, graph_version=graph_version, limit=limit
+        )
+        return asdict(snap)
+
     # ----- graph registry -------------------------------------------------
 
     @app.get("/graphs")
@@ -98,6 +132,15 @@ def create_app() -> FastAPI:
         return [asdict(f) for f in service_mod.list_files(graph_no)]
 
     # ----- durable pipeline ----------------------------------------------
+
+    @app.post("/graphs/{graph_no}/upload", status_code=201)
+    async def upload(graph_no: str, files: List[UploadFile] = File(...)) -> dict:
+        payload = [(f.filename or "", await f.read()) for f in files]
+        try:
+            added = service_mod.upload_files(graph_no, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"added": added}
 
     @app.post("/graphs/{graph_no}/ingest", status_code=202)
     def ingest(graph_no: str, req: IngestRequest) -> dict:
@@ -130,5 +173,15 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"task_no": task_no, "status": "QUEUED"}
+
+    # ----- static web UI --------------------------------------------------
+
+    if WEB_DIR.is_dir():
+
+        @app.get("/", include_in_schema=False)
+        def index() -> FileResponse:
+            return FileResponse(WEB_DIR / "index.html")
+
+        app.mount("/ui", StaticFiles(directory=str(WEB_DIR)), name="ui")
 
     return app

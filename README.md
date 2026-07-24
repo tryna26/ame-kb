@@ -66,10 +66,11 @@ python3 -m ame_kb.cli ingest --force
 # 4. 按名查实体 + 一跳直接关系
 python3 -m ame_kb.cli query "Ada"
 
-# 5. 跨文档实体融合（V5）：向量/全文找相似候选 → LLM 判同 → 合并
-python3 -m ame_kb.cli resolve --dry-run   # 只打印判同结果，不写库
+# 5. 跨文档实体融合（V5）：向量/全文找相似候选 → LLM 批量同义聚类 → 合并
+python3 -m ame_kb.cli resolve --dry-run   # 只打印聚类结果，不写库
 python3 -m ame_kb.cli resolve             # 真正融合（记别名 + 可回滚审计）
 python3 -m ame_kb.cli resolve --type Person   # 只融合某类型
+python3 -m ame_kb.cli resolve --prune     # 融合后再软删低支持度长尾节点（可回滚）
 
 # 5b. 回滚某次合并（按 merge_id，从审计快照还原）
 python3 -m ame_kb.cli rollback-merge <merge_id>
@@ -98,6 +99,10 @@ python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 ingest
 # 默认只查询最新 ACTIVE 版本；也可显式固定历史版本
 python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 search "Ada 做过什么？"
 python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 --graph-version 1 search "Ada 做过什么？"
+
+# 渐进式探索：同一 --state-id 复用于多次搜索，自动排除已返回过的节点（追问式深挖不重复）
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 search "登录怎么实现的" --state-id sess-42
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 search "还有别的吗" --state-id sess-42
 ```
 
 派生新版本时，未变化文档的节点、边、原文和搜索索引会直接继承，embedding 不会重新计算；只有新增/变化文档调用 LLM。构建中的 `BUILDING` 版本不会成为默认查询版本，中断构建可在下一次 `ingest` 时续跑。图谱选择通过请求/任务级 `GraphContext` 隔离，不修改进程级环境变量。
@@ -149,9 +154,10 @@ MySQL 是任务状态的权威存储。默认 `PIPELINE_QUEUE_BACKEND=database` 
 `resolve` 把跨文档指向同一现实实体、但名字不同的节点合并为一个 canonical 主实体（`src/ame_kb/resolve.py`）：
 
 - **候选召回**：对每个节点用其 `name + description + properties` 走 `HybridIndex.search`（向量 KNN + 全文，RRF 融合，复用 V4 检索栈）拿相似候选，排除自身。范式借鉴 general_recall 的双通道候选召回。
-- **LLM 判同**：`prompts/resolve_v5.txt` 让 LLM 判 `same / related / different`，只有 `same` 才合并；判 `same` 时返回「更完整的规范名」（借鉴 Graphiti「is_duplicate 时返回最完整全名」）。LLM/JSON 失败一律保守判 `different`，不冒进合并。
+- **批量同义聚类**：把种子 + 其同一本体类型的候选一次性交给 LLM（`prompts/resolve_cluster.txt`），让它把「同一现实实体的不同命名」归为若干簇，每簇给出「更完整的规范名」（借鉴 oceanai_site 的批量归一 + Graphiti「返回最完整全名」）。相比逐对判定，单个种子只需一次 LLM 调用，数据量大时显著省 token。LLM/JSON 失败一律返回空（不合并），且只采用模型复用的已知名字（不接受新造名）。
 - **字段并集融合**：`properties` 主实体优先、被合并方补空缺；`ref`（溯源行号）按 doc_id 并集；`description` 取更完整的一个。
 - **边重挂 canonical**：被合并节点上的边端点改挂到主实体（借鉴 general_recall `node_retriever`）。重挂后若与既有边 `edge_no` 撞键则合并并去重；塌成自环的边丢弃。
+- **低支持度剪枝（可选，默认关闭）**：合并后可选做一遍长尾剪枝（借鉴 oceanai_site `pruneLowSupport`）：软删只出现在少于 `RESOLVE_PRUNE_MIN_SUPPORT` 篇文档（`len(ref)`）、且没有任何活跃边引用的噪声节点；被边引用的节点一律保护，避免打断真实关系。每次剪枝同样快照进 `kg_merge_log`（status=`PRUNED`），可 `rollback-merge` 还原。通过 `resolve --prune` 或 `RESOLVE_PRUNE_ENABLED=true` 开启。
 - **别名 + 可回滚审计**：被合并方的名字（及被改名时主实体的旧名）写入 `kg_entity_alias`，reindex 时并进主实体的 `searchable_text`，于是**别名也能搜到主实体**；每次合并把 loser 全量 + 边端点原值快照进 `kg_merge_log`，`rollback-merge <merge_id>` 可完整还原。
 
 ## 数据库结构

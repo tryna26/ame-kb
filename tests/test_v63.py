@@ -28,7 +28,7 @@ def _reset_graph_context():
 def test_service_search_enters_resolved_graph_context(monkeypatch):
     seen = {}
 
-    def _fake_recall(query, window=0, trace=False):
+    def _fake_recall(query, window=0, trace=False, state_id=None):
         s = get_settings()
         seen["graph_no"] = s.graph_no
         seen["graph_version"] = s.graph_version
@@ -43,8 +43,32 @@ def test_service_search_enters_resolved_graph_context(monkeypatch):
 
     service_mod.search("q", graph_no="graph_abc", trace=True)
     assert seen == {"graph_no": "graph_abc", "graph_version": 7, "trace": True}
-    # Context must not leak after the call.
-    assert get_settings().graph_no != "graph_abc" or get_settings().graph_version != 7
+    # Context must not leak after the call: back to the environment default.
+    restored = get_settings()
+    assert (restored.graph_no, restored.graph_version) != ("graph_abc", 7)
+
+
+def test_service_search_inherits_callback_context(monkeypatch):
+    """No explicit graph_no -> inherit the context the CLI callback set,
+    instead of falling back to the environment default (regression)."""
+    from ame_kb import graphs as graphs_mod
+
+    seen = {}
+
+    def _fake_recall(query, window=0, trace=False, state_id=None):
+        s = get_settings()
+        seen["graph_no"] = s.graph_no
+        seen["graph_version"] = s.graph_version
+        return RecallResult(query=query)
+
+    monkeypatch.setattr(service_mod, "_recall", _fake_recall)
+    monkeypatch.setattr(graphs_mod, "_latest_version_safe", lambda g: 42)
+
+    # Simulate `--graph-no graph_xyz search "..."`: callback sets context, and
+    # the command calls service.search WITHOUT re-passing graph_no.
+    graphs_mod.apply_graph_context("graph_xyz", None)
+    service_mod.search("q")
+    assert seen == {"graph_no": "graph_xyz", "graph_version": 42}
 
 
 def test_service_search_defaults_do_not_query_kg_graph(monkeypatch):
@@ -53,7 +77,8 @@ def test_service_search_defaults_do_not_query_kg_graph(monkeypatch):
 
     monkeypatch.setattr(service_mod.graphs_mod, "_latest_version_safe", _boom)
     monkeypatch.setattr(
-        service_mod, "_recall", lambda query, window=0, trace=False: RecallResult(query)
+        service_mod, "_recall",
+        lambda query, window=0, trace=False, state_id=None: RecallResult(query)
     )
     # The default-graph sentinel keeps legacy behaviour: never a kg_graph lookup.
     service_mod.search("q", graph_no=service_mod.DEFAULT_GRAPH_NO)

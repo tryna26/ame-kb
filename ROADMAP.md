@@ -42,7 +42,7 @@
 | V3 | 全混合召回：FULLTEXT(ngram) + 向量 cosine + RRF + 10 步召回 + Ref 取原文 | ✅ 已交付 |
 | V4 | 可切换搜索后端 + doc chunk + 多 query + 多跳 + 重试阶梯 + URL 接入 | ✅ 已交付 |
 | V5 | 实体对齐与融合 + 固定两层本体（属性半动态） | ✅ 核心已交付（代码源后移） |
-| V6 | 版本化 + 规模化 pipeline + Agent 接口(REST/MCP) + UI | 🟡 V6.3 已交付（REST；MCP/UI 待做） |
+| V6 | 版本化 + 规模化 pipeline + Agent 接口(REST/MCP) + UI | 🟡 V6.4 已交付（REST + Web UI；MCP 待做） |
 | V7 | 高级能力（多租户 / schema 演化 / 图算法 / 图库迁移） | 🔴 可选 |
 
 ---
@@ -260,6 +260,21 @@ new_entity:
 - 测试 `test_v63`：service 图上下文解析/不泄漏、recall trace 字段、REST 端点（TestClient，service mock）。全量 85 passed。
 - 待做：MCP server（Agent memory interface）、UI 图可视化。
 
+### V6.4 — Web UI（单页静态）✅
+
+- 新增 `src/ame_kb/web/index.html`：零构建、零前端依赖的单页应用，由现有 FastAPI 直接挂载（`GET /` 返回页面，`/ui` 挂静态目录），套壳调用 V6.3 REST。
+- 四条主流程全覆盖：
+  - **提问**：调 `/search`，渲染命中实体 / 邻居 / 关系 / 原文证据 / 文档片段，并把 `RecallSession` trace（向量可用性、改写 query 数、重试 tier、各通道命中量）作为「为什么召回到这些」展示给用户。
+  - **知识库选择/创建**：顶栏下拉列出 `/graphs`，`+新建` 调 `create-graph`，全局切换当前库（每个 graph_no = 一个知识库容器）。
+  - **喂数据 + 任务进度**：浏览器拖拽上传文档 → 一键 `ingest` 入队 → 任务页轮询 `/tasks` 看逐版本构建进度，`FAILED` 可一键 `retry`（支持自动刷新）。
+  - **实体浏览**：按名查 `/entities`，点开看其 `/relations` 直接关系。
+- 新增上传通道打通「浏览器无法交出服务器路径」这一缺口：
+  - `api.py` 加 `POST /graphs/{no}/upload`（multipart）。
+  - `service.upload_files()` 把上传字节落到 `SOURCE_DIR`（manifest 根）再复用路径式 `add_file`，doc_no 派生与 CLI 完全一致；带路径穿越防护（`../x` 压成 basename 并锁在根目录内）、后缀白名单校验。
+  - `pyproject.toml`：api extra 增加 `python-multipart`，打包纳入 `ame_kb.web/*.html`。
+- 验证：86 tests passed；真实 `serve` 起服务后 `GET /`、`/ui/index.html` 均 200，`/upload` 路由在 openapi 可见；`upload_files` 的正常写入 / 路径穿越拦截 / 非法后缀拒绝均已用 mock 覆盖。
+- 说明：当前为**无鉴权**单页（任何人可读写所有知识库），"每个人管自己的库"的身份/归属层放在 V6.5 + V7。图可视化（Cytoscape/sigma）与节点/边人工编辑仍待做。
+
 ### 功能范围
 
 ```
@@ -273,7 +288,8 @@ API:
 - MCP server（Agent memory interface）
 
 UI:
-- 图可视化、搜索结果解释、原文证据展示、节点/边人工编辑（配合 V5 merge_log 回滚）
+- ✅ 单页 Web（提问 / 建库 / 上传+ingest / 任务进度 / 实体浏览 + 召回 trace）
+- 图可视化、节点/边人工编辑（配合 V5 merge_log 回滚）
 ```
 
 ### 多跳策略（沿用 V4 实现，规模化时强化）
@@ -305,7 +321,82 @@ UI:
 1. ✅ 大批文档可后台处理，失败可重试、可断点续跑
 2. ✅ 返回 seeds / 邻居 / 证据来源 + session trace（V6.3 已加）
 3. 🟡 Agent 可通过 REST 调用召回（V6.3 已交付 REST；MCP 待做）
-4. 图可视化能辅助人工修正实体/边（待做）
+4. ✅ Web UI 可提问 / 建库 / 上传+ingest / 看任务进度 / 浏览实体（V6.4 已交付；图可视化人工修正待做）
+
+---
+
+## 上线完备性差距分析（"每个人建库并提问"的公网产品）
+
+> 目标形态：任何人注册后创建/修改自己的知识库并提问。当前内核（ingest → 图 → 召回 → REST → UI）已通，
+> 但从"能 demo"到"能放公网给陌生人用"，缺的主要是**身份、隔离、安全、成本、运维**这五类非功能能力。
+> 下面把差距按优先级排成 V6.5 → V6.6 → V8，越靠前越是"不做就不能公开"的硬门槛。
+
+### 🔴 P0 — 不做就不能公开（V6.5：账号与隔离）
+
+产品化的第一硬门槛。现在 UI/REST 完全无鉴权，任何人可读写所有 graph。
+
+| 差距 | 说明 | 落点 |
+|---|---|---|
+| 用户账号 | 注册/登录/会话；密码哈希或 OAuth（GitHub/Google 第三方登录最省心） | 新 `kg_user` 表 + auth 中间件 |
+| 图谱归属 | `kg_graph` 加 `owner_id`；`list_graphs` / 所有 graph 操作按 owner 过滤 | `schema.sql` + `graphs.py` + `service.py` |
+| 越权防护 | 每个 `/search`、`/upload`、`/ingest`、`/tasks/*` 校验"这个 graph 是不是你的"，否则 A 能读写 B 的库 | API 依赖注入 `current_user` |
+| API 鉴权 | REST 全量加 token/session；Agent 走 API Key（区别于网页会话） | `api.py` |
+| 隔离粒度决策 | 方案 A（graph 级归属，轻量，推荐）vs 方案 B（启用全链路 `workspace_id`，彻底但工作量大） | 见 V7 多租户 |
+
+### 🔴 P0 — 上传即代码执行/滥用面（V6.5：输入与安全）
+
+公网上传是最大攻击面，必须收口。
+
+| 差距 | 说明 |
+|---|---|
+| 上传限额 | 单文件大小、单库文件数、单用户总配额；否则一个人能撑爆磁盘/DB |
+| 文件类型硬校验 | 现在只看后缀白名单，需校验真实 MIME/魔数（防伪装的可执行内容）；PDF/HTML 解析器 CVE 面要盯 |
+| SSRF 防护 | `ingest-url` 让服务器去 fetch 任意 URL——公网必须拦内网地址（169.254/10./127. 等），否则被当跳板 |
+| LLM 成本护栏 | 每次 ingest/召回都烧 LLM/embedding token。需按用户限流 + 配额 + 熔断，否则一个人能刷爆你的 API 账单 |
+| Prompt 注入 | 上传文档内容会进抽取/召回 prompt，可能挟持 LLM 输出。至少做输出结构校验（已有部分 validate） |
+
+### 🟠 P1 — 好用度与信任（V6.6：产品体验）
+
+有了这些才是"好用的产品"，而不只是"能用的工具"。
+
+| 差距 | 说明 |
+|---|---|
+| 库管理闭环 | 删除库、重命名、删除单个文档（现在 UI 只能加不能删）、版本历史查看/回滚 |
+| 实体人工修正 | 配合 V5 `merge_log`：UI 里合并/拆分/编辑节点与边、回滚错误合并（V6 验收里列了但没做） |
+| 召回质量反馈 | 用户对答案点赞/踩 → 沉淀评测集，驱动召回调参（否则无法闭环优化质量） |
+| 图可视化 | Cytoscape/sigma 展示子图，让用户"看见"自己的知识结构（V6 一直挂着的待做项） |
+| 引用透明 | 答案已带原文证据行，但需要更清晰的"这句话来自哪个文档哪一行"的溯源 UI |
+| 空状态引导 | 新用户第一次进来该看到什么（示例库、上传引导、提问示例） |
+| MCP server | 让 Claude/Cursor 等 Agent 直接把它当记忆层调用（V6.3 就列的待做，是差异化卖点） |
+
+### 🟠 P1 — 能放公网跑（V6.6：部署与运维）
+
+| 差距 | 说明 |
+|---|---|
+| 容器化部署 | Dockerfile + docker-compose（app + MySQL + Redis 一键起）；现在只有本地 venv 跑法 |
+| 配置与密钥管理 | 生产的 LLM key / DB 密码走 secret，不进代码；多环境配置 |
+| 健康检查/监控 | `/health`、结构化日志、错误上报（Sentry 类）、召回延迟与 LLM 花费看板 |
+| 数据备份 | MySQL 定时备份、Redis 持久化策略（RediSearch 索引可重建但要有预案） |
+| 速率限制/防刷 | 网关层限流、验证码/防注册滥用 |
+| HTTPS/域名 | 反向代理（nginx/caddy）+ TLS |
+
+### 🟡 P2 — 规模化与合规（V8：长期）
+
+| 差距 | 说明 |
+|---|---|
+| 计费 | 若要商业化：用量计量、套餐、支付 |
+| 数据合规 | 用户数据删除权（GDPR 式）、隐私政策、数据导出 |
+| 多租户彻底隔离 | 启用全链路 `workspace_id`（V4 已建 dormant 字段），或按库物理分片 |
+| 规模化后端 | 向量涨到百万级切 pgvector；MySQL 边表深度遍历卡顿时评估 Neo4j（均已在设计中预留接口） |
+| 团队/协作 | 库共享、成员权限、组织概念 |
+
+### 建议的最小上线路径（MVP for public）
+
+> 只做到"能安全地让陌生人各自建库提问"，砍掉一切非必需：
+
+1. **V6.5**（P0 全部）：第三方登录 + `owner_id` 归属 + 越权校验 + 上传限额 + LLM 配额/限流 + SSRF 拦截。
+2. **V6.6 精简**：Docker 一键部署 + `/health` + HTTPS + 删除库/文档 + 基础监控。
+3. 其余（图可视化、MCP、计费、协作）**上线后按反馈迭代**，不阻塞首发。
 
 ---
 

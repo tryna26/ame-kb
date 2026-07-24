@@ -16,7 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 redis = ["redis>=5.0"]
-api = ["fastapi>=0.110", "uvicorn>=0.29"]
+api = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9"]
+code = ["tree-sitter>=0.23,<0.24", "tree-sitter-python>=0.23", "tree-sitter-go>=0.23"]
 
 [project.scripts]
 ame-kb = "ame_kb.cli:app"
@@ -30,3 +31,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "ame_kb.prompts" = ["*.txt"]
+"ame_kb.web" = ["*.html"]

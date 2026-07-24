@@ -47,6 +47,11 @@ python scripts/kb.py search "why did we pick RediSearch for vectors?" --graph gr
 # Narrow/pin: choose a graph, pin a version, widen evidence context
 python scripts/kb.py search "<q>" --graph graph_abc --version 3 --window 2
 
+# Dig deeper: reuse the same --state-id across follow-ups to get NEW nodes each
+# time (already-returned nodes are excluded). Use a fresh id to start over.
+python scripts/kb.py search "how does login work?" --graph graph_abc --state-id s1
+python scripts/kb.py search "what else?"           --graph graph_abc --state-id s1
+
 # Raw JSON (when you need to parse fields programmatically)
 python scripts/kb.py search "<q>" --graph graph_abc --json
 
@@ -68,6 +73,9 @@ python scripts/kb.py entities graph_abc "Aurora"  # find entities by name
 - **Evidence lines** — `doc_no:line_no  content`: the *original text* backing the
   answer. **Ground your answer in these**, and cite them.
 - **Doc chunks** — fallback passages retrieved even when the graph is sparse.
+- **State line** — when `--state-id` is used: how many distinct nodes have been
+  explored under that id so far. Rerun the same id to page through more of the
+  graph without repeats; switch ids (or omit) to reset.
 - **Session trace** — *why* these results: `embedding_available` (was vector
   search active), `queries` (rewrites used), `pool_sizes`/`final_pool`,
   `tier_used` (retry ladder), per-hop candidate/picked counts, and final counts.

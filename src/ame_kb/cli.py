@@ -175,6 +175,34 @@ def ingest_cmd(
         typer.echo(f"\nSkipped {skipped} unchanged document(s).")
 
 
+@app.command("ingest-code")
+def ingest_code_cmd(
+    repo: str = typer.Option(..., "--repo", "-r", help="Repository path to scan."),
+    lang: str = typer.Option(
+        None, "--lang", help="Comma-separated languages (default: CODE_LANGS)."
+    ),
+    dry_run: bool = typer.Option(
+        False, help="Parse and print structure, do not write DB."
+    ),
+) -> None:
+    """Tree-sitter structural extraction of a code repo into the graph (zero LLM)."""
+    from .code.ingest import ingest_repo
+
+    langs = [s.strip() for s in lang.split(",") if s.strip()] if lang else None
+    report = ingest_repo(repo, langs, project=not dry_run)
+    typer.echo(f"Repo {report.repo_id}: {report.nodes} node(s), {report.edges} edge(s)")
+    typer.echo(f"  code graph cached at {report.cache_path}")
+    if dry_run:
+        typer.echo("  (dry-run: structure parsed, DB not written)")
+        return
+    s = report.stats
+    typer.echo(
+        "  projected: "
+        f"nodes +{s.nodes_new}/~{s.nodes_updated}, "
+        f"edges +{s.edges_new}/~{s.edges_updated}"
+    )
+
+
 def _ingest_managed(
     graph_no: str, *, dry_run: bool, force: bool, allow_empty: bool
 ) -> None:
@@ -479,10 +507,16 @@ def search_cmd(
     trace: bool = typer.Option(
         False, help="Print a recall session trace (pool sizes, tiers, hops)."
     ),
+    state_id: str = typer.Option(
+        None,
+        "--state-id",
+        help="Progressive exploration: reuse across searches to skip "
+        "already-returned nodes (dig deeper without repeats).",
+    ),
 ) -> None:
     """Run hybrid recall (FULLTEXT + vector, RRF) and print seeds, neighbors,
     connecting edges, and the original evidence lines."""
-    res = service_mod.search(query, window=window, trace=trace)
+    res = service_mod.search(query, window=window, trace=trace, state_id=state_id)
     for w in res.warnings:
         typer.echo(f"  warning: {w}")
 
@@ -539,6 +573,12 @@ def search_cmd(
             f"doc_chunks={s.doc_chunk_count}"
         )
 
+    if res.state_id:
+        typer.echo(
+            f"\n# State {res.state_id}: {res.explored_total} node(s) explored so far "
+            f"(rerun with the same --state-id to dig deeper)."
+        )
+
 
 @app.command("reindex")
 def reindex_cmd() -> None:
@@ -572,19 +612,30 @@ def resolve_cmd(
         None, help="Candidate top-K per node (default RESOLVE_CANDIDATE_TOPK)."
     ),
     dry_run: bool = typer.Option(
-        False, help="Judge and print, do not merge or write."
+        False, help="Cluster and print, do not merge/prune or write."
+    ),
+    prune: bool = typer.Option(
+        None,
+        "--prune/--no-prune",
+        help="Soft-delete low-support long-tail nodes after merging "
+        "(default RESOLVE_PRUNE_ENABLED).",
     ),
 ) -> None:
-    """Cross-document entity fusion: find duplicate nodes (vector/full-text KNN),
-    LLM-judge same/related/different, and merge duplicates into a canonical
-    survivor. Merges record an alias + a rollback-able audit row."""
-    stats = service_mod.resolve_all(type_filter=type_, dry_run=dry_run, limit=limit)
+    """Cross-document entity fusion: KNN-recall same-type candidates, batch-cluster
+    synonyms in one LLM call, and merge each cluster into a canonical survivor.
+    Merges record an alias + a rollback-able audit row. With --prune, a final
+    pass soft-deletes low-support noise nodes (also rollback-able)."""
+    stats = service_mod.resolve_all(
+        type_filter=type_, dry_run=dry_run, limit=limit, prune=prune
+    )
     for j in stats.judgments:
         typer.echo(f"  {j}")
     verb = "would merge" if dry_run else "merged"
+    pverb = "would prune" if dry_run else "pruned"
     typer.echo(
         f"\nScanned {stats.scanned} node(s); {verb} {stats.merged}, "
-        f"skipped {stats.skipped} non-duplicate pair(s)."
+        f"skipped {stats.skipped} non-duplicate cluster(s); "
+        f"{pverb} {stats.pruned} low-support node(s)."
     )
 
 

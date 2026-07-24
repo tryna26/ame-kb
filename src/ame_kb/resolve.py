@@ -1,15 +1,22 @@
-"""V5 cross-document entity fusion (resolve).
+"""Cross-document entity fusion (resolve).
 
-Pipeline per node: vector/full-text KNN candidates -> LLM same/related/different
-judge -> merge duplicates into a canonical survivor. Merges are:
+Per seed node: vector/full-text KNN candidates -> one **batch** LLM call that
+clusters synonymous names -> merge each cluster into a canonical survivor.
+Batch clustering replaces the old O(n*candidates) pairwise judge: one LLM call
+per seed groups all its candidates at once, which is far cheaper in tokens.
+Merges are:
   - field-union (properties + ref) with the survivor winning conflicts,
   - edge remap: every edge touching the loser is re-pointed at the winner,
   - alias recorded (kg_entity_alias) so the old name still resolves,
   - fully snapshotted (kg_merge_log) so a merge can be rolled back.
 
+An optional low-support pruning pass (opt-in) soft-deletes long-tail noise
+nodes -- those seen in fewer than `resolve_prune_min_support` docs and touched
+by no live edge -- also snapshotted for rollback.
+
 Borrows: general_recall dual-channel KNN candidate retrieval + canonical
-node_no edge remap; Graphiti's "is_duplicate -> return the most complete name"
-judge; the project's own extract.py LLM call pattern.
+node_no edge remap; oceanai_site's batch synonym clustering + low-support
+pruning; Graphiti's "return the most complete name" canonicalization.
 """
 from __future__ import annotations
 
@@ -41,13 +48,14 @@ class ResolveStats:
     scanned: int = 0
     merged: int = 0
     skipped: int = 0
+    pruned: int = 0
     judgments: List[str] = field(default_factory=list)
 
 
-def _load_prompt() -> str:
+def _load_prompt(name: str) -> str:
     return (
         resources.files("ame_kb.prompts")
-        .joinpath("resolve_v5.txt")
+        .joinpath(name)
         .read_text(encoding="utf-8")
     )
 
@@ -66,36 +74,45 @@ def _fill_prompt(template: str, mapping: Dict[str, str]) -> str:
     )
 
 
-def judge(a: Dict, b: Dict) -> Dict:
-    """Ask the LLM whether two entities are the same. Returns
-    {"verdict": same|related|different, "canonical_name": str, "reason": str}.
+def cluster(entity_type: str, entities: List[Dict]) -> List[Dict]:
+    """Group synonymous names among same-type candidates in one LLM call.
 
-    Inputs are dicts with name/type/description/properties. Any LLM/parse
-    failure degrades to a conservative 'different'.
+    `entities` are dicts with name/description/properties. Returns a list of
+    {"canonical": str, "names": [str, ...]} clusters (each with >= 2 names).
+    Any LLM/parse failure degrades to an empty list (merge nothing).
     """
+    if len(entities) < 2:
+        return []
+    payload_entities = [
+        {
+            "name": str(e.get("name", "")),
+            "description": str(e.get("description") or ""),
+            "properties": e.get("properties") or {},
+        }
+        for e in entities
+    ]
     mapping = {
-        "name_a": str(a.get("name", "")),
-        "type_a": str(a.get("type", "")),
-        "desc_a": str(a.get("description") or ""),
-        "props_a": json.dumps(a.get("properties") or {}, ensure_ascii=False),
-        "name_b": str(b.get("name", "")),
-        "type_b": str(b.get("type", "")),
-        "desc_b": str(b.get("description") or ""),
-        "props_b": json.dumps(b.get("properties") or {}, ensure_ascii=False),
+        "type": str(entity_type or ""),
+        "entities": json.dumps(payload_entities, ensure_ascii=False),
     }
-    prompt = _fill_prompt(_load_prompt(), mapping)
+    prompt = _fill_prompt(_load_prompt("resolve_cluster.txt"), mapping)
     try:
-        payload = _extract_json(call_llm(prompt))
-    except Exception:  # noqa: BLE001 - bad JSON / no LLM -> don't merge
-        return {"verdict": "different", "canonical_name": "", "reason": "judge failed"}
-    verdict = str(payload.get("verdict", "different")).lower()
-    if verdict not in ("same", "related", "different"):
-        verdict = "different"
-    return {
-        "verdict": verdict,
-        "canonical_name": payload.get("canonical_name", "") or "",
-        "reason": payload.get("reason", "") or "",
-    }
+        parsed = _extract_json(call_llm(prompt))
+    except Exception:  # noqa: BLE001 - bad JSON / no LLM -> merge nothing
+        return []
+    valid_names = {e["name"] for e in payload_entities if e["name"]}
+    clusters: List[Dict] = []
+    for raw in parsed.get("clusters") or []:
+        # Only keep names the model was actually given (no invented names).
+        names = [n for n in (raw.get("names") or []) if n in valid_names]
+        names = list(dict.fromkeys(names))  # dedup, keep order
+        if len(names) < 2:
+            continue
+        canonical = raw.get("canonical") or ""
+        if canonical not in valid_names:
+            canonical = ""
+        clusters.append({"canonical": canonical, "names": names})
+    return clusters
 
 
 def find_candidates(
@@ -372,8 +389,9 @@ def merge(winner_no: str, loser_no: str, *, canonical_name: str = "") -> str:
 
 
 def rollback(merge_id: str) -> None:
-    """Undo a merge from its snapshot: restore both nodes, un-remap edges, drop
-    the aliases we added, and reindex. Raises ValueError if not found/undone."""
+    """Undo a merge or prune from its snapshot. For a merge: restore both nodes,
+    un-remap edges, drop the aliases we added, and reindex. For a prune: restore
+    the single soft-deleted node. Raises ValueError if not found/already undone."""
     settings = get_settings()
     with session_scope() as session:
         log = session.execute(
@@ -388,6 +406,24 @@ def rollback(merge_id: str) -> None:
         if log.status == "ROLLED_BACK":
             raise ValueError(f"merge {merge_id} already rolled back")
         snap = log.snapshot or {}
+
+        # A prune snapshot only soft-deleted a single node (no winner/edges).
+        if log.status == "PRUNED" or snap.get("kind") == "prune":
+            loser = _load_node(
+                session, settings, log.loser_node_no, include_deleted=True
+            )
+            if loser is None:
+                raise ValueError("cannot rollback: pruned node missing")
+            lo = snap.get("loser", {})
+            loser.name = lo.get("name", loser.name)
+            loser.description = lo.get("description")
+            loser.properties = lo.get("properties") or {}
+            loser.ref = lo.get("ref") or {}
+            loser.deleted = 0
+            _restore_domain(session, settings, log.loser_node_no)
+            _reindex_node(session, loser)
+            log.status = "ROLLED_BACK"
+            return
 
         winner = _load_node(session, settings, log.winner_node_no)
         loser = _load_node(session, settings, log.loser_node_no, include_deleted=True)
@@ -532,46 +568,56 @@ def alias_of(canonical_name_or_no: str) -> List[str]:
         return list(rows)
 
 
-def resolve_all(
-    type_filter: Optional[str] = None, dry_run: bool = False, limit: Optional[int] = None
-) -> ResolveStats:
-    """Scan live nodes; for each, find candidates, judge, and merge duplicates.
+def _live_node_nos(session, settings, type_filter: Optional[str]) -> List[str]:
+    """Live node business keys in scan order, optionally filtered by ontology type."""
+    conds = [
+        GraphNode.graph_no == settings.graph_no,
+        GraphNode.graph_version == settings.graph_version,
+        GraphNode.deleted == 0,
+    ]
+    if type_filter:
+        # The ontology class lives in the domain layer; filter via a join on the
+        # shared graph_node_no.
+        stmt = (
+            select(GraphNode.graph_node_no)
+            .join(
+                DomainEntity,
+                and_(
+                    DomainEntity.graph_no == GraphNode.graph_no,
+                    DomainEntity.graph_version == GraphNode.graph_version,
+                    DomainEntity.graph_node_no == GraphNode.graph_node_no,
+                ),
+            )
+            .where(*conds, DomainEntity.type == type_filter)
+            .order_by(GraphNode.id)
+        )
+    else:
+        stmt = select(GraphNode.graph_node_no).where(*conds).order_by(GraphNode.id)
+    return list(session.execute(stmt).scalars().all())
 
-    Nodes judged the same collapse via union-find into a single deterministic
+
+def resolve_all(
+    type_filter: Optional[str] = None,
+    dry_run: bool = False,
+    limit: Optional[int] = None,
+    prune: Optional[bool] = None,
+) -> ResolveStats:
+    """Scan live nodes; for each, KNN-recall same-type candidates, batch-cluster
+    synonyms in one LLM call, and merge each cluster into a canonical survivor.
+
+    Nodes clustered together collapse via union-find into a single deterministic
     survivor (the earliest-scanned member of the set), so every loser merges
     directly into that one winner. This avoids chained merges where a node that
     already won a merge is later used as a loser (which would strand aliases and
-    edges). Each unordered pair is judged at most once per run.
+    edges).
+
+    When `prune` (or the RESOLVE_PRUNE_ENABLED default) is on, a final pass
+    soft-deletes low-support long-tail noise nodes (see `prune_low_support`).
     """
     settings = get_settings()
     stats = ResolveStats()
     with session_scope() as session:
-        conds = [
-            GraphNode.graph_no == settings.graph_no,
-            GraphNode.graph_version == settings.graph_version,
-            GraphNode.deleted == 0,
-        ]
-        if type_filter:
-            # The ontology class lives in the domain layer; filter via a join on
-            # the shared graph_node_no.
-            stmt = (
-                select(GraphNode.graph_node_no)
-                .join(
-                    DomainEntity,
-                    and_(
-                        DomainEntity.graph_no == GraphNode.graph_no,
-                        DomainEntity.graph_version == GraphNode.graph_version,
-                        DomainEntity.graph_node_no == GraphNode.graph_node_no,
-                    ),
-                )
-                .where(*conds, DomainEntity.type == type_filter)
-                .order_by(GraphNode.id)
-            )
-        else:
-            stmt = (
-                select(GraphNode.graph_node_no).where(*conds).order_by(GraphNode.id)
-            )
-        node_nos = session.execute(stmt).scalars().all()
+        node_nos = _live_node_nos(session, settings, type_filter)
 
     # Union-find over node_nos. The set representative is always the member that
     # appears earliest in scan order (smallest GraphNode.id), so find(x) yields
@@ -598,8 +644,8 @@ def resolve_all(
         else:
             parent[ra] = rb
 
-    judged_pairs: set = set()  # frozenset({no_a, no_b}) already sent to judge()
-    same_pairs: List[tuple] = []  # (no_a, no_b, canonical_name) judged "same"
+    canonical_for_root: Dict[str, str] = {}
+    involved: set = set()
 
     for nno in node_nos:
         # Skip nodes already absorbed as a loser (they have an earlier root).
@@ -619,43 +665,50 @@ def resolve_all(
                 settings.graph_version,
                 [nno] + cand_nos,
             )
-            node_view = _node_snapshot(node, domain_map.get(nno))
+            seed_view = _node_snapshot(node, domain_map.get(nno))
             cand_views = [
                 (c.graph_node_no, _node_snapshot(c, domain_map.get(c.graph_node_no)))
                 for c in candidates
             ]
-        for cand_no, cand_view in cand_views:
-            # Skip candidates already absorbed as a loser, already in the same
-            # set, or unordered pairs we have already judged this run.
-            if find(cand_no) != cand_no:
-                continue
-            if find(cand_no) == find(nno):
-                continue
-            pair_key = frozenset((nno, cand_no))
-            if pair_key in judged_pairs:
-                continue
-            judged_pairs.add(pair_key)
-            verdict = judge(node_view, cand_view)
-            if verdict["verdict"] == "same":
-                stats.judgments.append(
-                    f"SAME {node_view['name']} == {cand_view['name']} "
-                    f"({verdict['reason']})"
-                )
-                union(nno, cand_no)
-                same_pairs.append((nno, cand_no, verdict["canonical_name"]))
-            else:
-                stats.skipped += 1
 
-    # Pick the best canonical_name per surviving set (first non-empty, in the
-    # order pairs were judged -> deterministic).
-    canonical_for_root: Dict[str, str] = {}
-    for a, _b, cname in same_pairs:
-        root = find(a)
-        if cname and not canonical_for_root.get(root):
-            canonical_for_root[root] = cname
+        seed_type = seed_view.get("type") or ""
+        # Only cluster within the same ontology type, and drop candidates already
+        # absorbed as a loser or already in the seed's set.
+        pool = [(nno, seed_view)]
+        for cand_no, cand_view in cand_views:
+            if find(cand_no) != cand_no or find(cand_no) == find(nno):
+                continue
+            if (cand_view.get("type") or "") != seed_type:
+                continue
+            pool.append((cand_no, cand_view))
+        if len(pool) < 2:
+            continue
+
+        name_to_no: Dict[str, str] = {}
+        for pno, pview in pool:
+            name_to_no.setdefault(pview["name"], pno)
+        clusters = cluster(seed_type, [pv for _pno, pv in pool])
+        for grp in clusters:
+            members = [name_to_no[n] for n in grp["names"] if n in name_to_no]
+            members = [m for m in members if find(m) == m]  # skip absorbed
+            members = list(dict.fromkeys(members))
+            if len(members) < 2:
+                stats.skipped += 1
+                continue
+            base = members[0]
+            for m in members[1:]:
+                union(base, m)
+            root = find(base)
+            cname = grp.get("canonical") or ""
+            if cname and not canonical_for_root.get(root):
+                canonical_for_root[root] = cname
+            involved.update(members)
+            stats.judgments.append(
+                f"CLUSTER {cname or seed_view['name']} <= "
+                f"[{', '.join(grp['names'])}]"
+            )
 
     # Every non-winner member of a set merges directly into the one survivor.
-    involved = {n for pair in same_pairs for n in pair[:2]}
     members_by_root: Dict[str, List[str]] = {}
     for no in sorted(involved, key=lambda n: order_index.get(n, 1 << 30)):
         members_by_root.setdefault(find(no), []).append(no)
@@ -668,12 +721,95 @@ def resolve_all(
                 continue  # the winner is never used as a loser
             pending.append((root, member, cname))
 
+    do_prune = prune if prune is not None else settings.resolve_prune_enabled
+
     if dry_run:
+        if do_prune:
+            pstats = prune_low_support(type_filter=type_filter, dry_run=True)
+            stats.pruned = pstats.pruned
+            stats.judgments.extend(pstats.judgments)
         return stats
+
     for winner_no, loser_no, canonical in pending:
         try:
             merge(winner_no, loser_no, canonical_name=canonical)
             stats.merged += 1
         except ValueError as exc:
             stats.judgments.append(f"merge skipped: {exc}")
+
+    if do_prune:
+        pstats = prune_low_support(type_filter=type_filter)
+        stats.pruned = pstats.pruned
+        stats.judgments.extend(pstats.judgments)
+    return stats
+
+
+def _edge_referenced_nodes(session, settings) -> set:
+    """Set of node_nos touched by at least one live edge (both endpoints)."""
+    rows = session.execute(
+        select(GraphEdge.source_node_no, GraphEdge.target_node_no).where(
+            GraphEdge.graph_no == settings.graph_no,
+            GraphEdge.graph_version == settings.graph_version,
+            GraphEdge.deleted == 0,
+        )
+    ).all()
+    referenced: set = set()
+    for src, dst in rows:
+        referenced.add(src)
+        referenced.add(dst)
+    return referenced
+
+
+def prune_low_support(
+    type_filter: Optional[str] = None,
+    min_support: Optional[int] = None,
+    dry_run: bool = False,
+) -> ResolveStats:
+    """Soft-delete long-tail noise nodes: those seen in fewer than `min_support`
+    distinct docs (``len(ref)``) and touched by no live edge. Each drop is
+    snapshotted to kg_merge_log (status PRUNED) so it can be rolled back.
+
+    Nodes referenced by any live edge are always protected -- pruning them would
+    orphan real relations.
+    """
+    settings = get_settings()
+    min_support = (
+        min_support if min_support is not None else settings.resolve_prune_min_support
+    )
+    stats = ResolveStats()
+    with session_scope() as session:
+        node_nos = _live_node_nos(session, settings, type_filter)
+        referenced = _edge_referenced_nodes(session, settings)
+        for nno in node_nos:
+            node = _load_node(session, settings, nno)
+            if node is None or nno in referenced:
+                continue
+            if len(node.ref or {}) >= min_support:
+                continue
+            stats.judgments.append(
+                f"PRUNE {node.name} (support={len(node.ref or {})})"
+            )
+            stats.pruned += 1
+            if dry_run:
+                continue
+            snapshot = {
+                "loser": _node_snapshot(
+                    node, _domain_of(session, settings, nno)
+                ),
+                "kind": "prune",
+            }
+            node.deleted = 1
+            _soft_delete_domain(session, settings, nno)
+            get_index().delete_objects(NODE, [nno], session=session)
+            session.add(
+                MergeLog(
+                    graph_no=settings.graph_no,
+                    graph_version=settings.graph_version,
+                    merge_id=uuid.uuid4().hex,
+                    winner_node_no="",
+                    loser_node_no=nno,
+                    snapshot=snapshot,
+                    status="PRUNED",
+                )
+            )
     return stats

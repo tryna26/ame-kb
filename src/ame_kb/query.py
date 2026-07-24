@@ -29,6 +29,81 @@ class RelationHit:
     other_type: str
 
 
+@dataclass
+class GraphNodeDTO:
+    graph_node_no: str
+    name: str
+    type: str
+
+
+@dataclass
+class GraphEdgeDTO:
+    graph_edge_no: str
+    source_node_no: str
+    target_node_no: str
+    label: str
+
+
+@dataclass
+class GraphSnapshot:
+    nodes: List[GraphNodeDTO]
+    edges: List[GraphEdgeDTO]
+
+
+def graph_snapshot(limit: int = 2000) -> GraphSnapshot:
+    """Return the full node + edge set of the active graph version for
+    whole-graph visualization. Nodes are capped by ``limit``; edges are kept
+    only when both endpoints are within the returned node set.
+    """
+    settings = get_settings()
+    with session_scope() as session:
+        node_rows = (
+            session.execute(
+                select(GraphNode)
+                .where(
+                    GraphNode.graph_no == settings.graph_no,
+                    GraphNode.graph_version == settings.graph_version,
+                    GraphNode.deleted == 0,
+                )
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        node_nos = [r.graph_node_no for r in node_rows]
+        domain_map = load_domain_map(
+            session, settings.graph_no, settings.graph_version, node_nos
+        )
+        nodes = [
+            GraphNodeDTO(
+                r.graph_node_no,
+                r.name,
+                domain_map.get(r.graph_node_no, (r.type, None))[0],
+            )
+            for r in node_rows
+        ]
+        node_set = set(node_nos)
+        edge_rows = (
+            session.execute(
+                select(GraphEdge).where(
+                    GraphEdge.graph_no == settings.graph_no,
+                    GraphEdge.graph_version == settings.graph_version,
+                    GraphEdge.deleted == 0,
+                )
+            )
+            .scalars()
+            .all()
+        )
+        edges = [
+            GraphEdgeDTO(
+                e.graph_edge_no, e.source_node_no, e.target_node_no, e.name
+            )
+            for e in edge_rows
+            if e.source_node_no in node_set and e.target_node_no in node_set
+        ]
+        return GraphSnapshot(nodes=nodes, edges=edges)
+
+
 def find_entities(name: str, limit: int = 20) -> List[NodeHit]:
     settings = get_settings()
     with session_scope() as session:
