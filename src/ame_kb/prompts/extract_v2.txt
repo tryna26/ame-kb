@@ -14,8 +14,10 @@
    - `INFERRED`：根据上下文合理推断、但未明说的关系。
    - `AMBIGUOUS`：不确定、存疑的关系。
 6. `source` 必须是文档中真实出现的行号范围，格式 `["起-止", ...]`，禁止捏造。
-7. 关系的 `source_name` / `target_name` 必须与你在 `nodes` 中输出的某个节点 `name` 完全一致。
-8. 只抽取文档明确表达的信息；不确定就不抽。
+7. 每个节点必须带文档内唯一的 `mention_id`（例如 `m1`、`m2`）。即使两个节点同名，也不能复用同一个 `mention_id`。
+8. 关系必须通过 `source_mention_id` / `target_mention_id` 引用本次 `nodes` 中的 `mention_id`；不要用名称引用端点。
+9. 同一文档不要重复输出相同 `type` 且相同名称的节点；无法稳定区分时宁可不抽取。
+10. 只抽取文档明确表达的信息；不确定就不抽。
 
 # 文档
 > 每行已加 `[N] ` 行号前缀，仅用于让你在 `source` 里引用行范围，不属于正文。
@@ -26,9 +28,9 @@
 # 输出格式（严格输出 JSON，不要输出多余文字）
 {
   "nodes": [
-    {"name": "实体名", "type": "Person|Organization|Project|Document|Concept", "properties": {}, "source": ["3-5"]}
+    {"mention_id": "m1", "name": "实体名", "type": "Person|Organization|Project|Document|Concept", "properties": {}, "source": ["3-5"]}
   ],
   "edges": [
-    {"source_name": "起点节点名", "target_name": "终点节点名", "label": "works_for|authored|part_of|mentions|related_to", "confidence": "EXTRACTED|INFERRED|AMBIGUOUS", "source": ["7-7"]}
+    {"source_mention_id": "m1", "target_mention_id": "m2", "label": "works_for|authored|part_of|mentions|related_to", "confidence": "EXTRACTED|INFERRED|AMBIGUOUS", "source": ["7-7"]}
   ]
 }

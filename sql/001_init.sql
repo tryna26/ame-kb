@@ -29,17 +29,24 @@ CREATE TABLE IF NOT EXISTS `kg_graph_node`
     `id`            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     `graph_no`      VARCHAR(128)    NOT NULL DEFAULT 'default' COMMENT '所属图谱 No',
     `graph_version` BIGINT          NOT NULL DEFAULT 1 COMMENT '图谱版本',
-    `graph_node_no` VARCHAR(191)    NOT NULL COMMENT '业务键 = type:slug(name)，按名去重',
+    `graph_node_no` VARCHAR(191)    NOT NULL COMMENT '稳定业务键 = node:{uuid}',
     `name`          VARCHAR(255)    NOT NULL DEFAULT '' COMMENT '节点名称',
     `type`          VARCHAR(64)     NOT NULL DEFAULT '' COMMENT '节点类型（引用 kg_domain_entity.entity_name）',
+    `description`   TEXT            NULL COMMENT '节点描述（用于消歧与 embedding）',
     `properties`    JSON            NULL COMMENT '属性值兜底',
     `ref`           JSON            NULL COMMENT '来源指针 {docPath:[行范围]}',
+    `aliases`       JSON            NULL COMMENT '所有原始表面名称（JSON array）',
+    `merged_into`   VARCHAR(191)    NULL COMMENT '软删除节点重定向到的 canonical node',
+    `embedding`     JSON            NULL COMMENT 'OpenAI-compatible embedding 数组',
+    `embedding_hash` CHAR(64)       NULL COMMENT 'embedding model + input SHA-256',
+    `embedding_model` VARCHAR(255)  NULL COMMENT '生成 embedding 的模型',
     `deleted`       TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '软删除标志',
     `create_time`   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `update_time`   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_node_no` (`graph_no`, `graph_version`, `graph_node_no`),
-    KEY `idx_name` (`name`)
+    KEY `idx_name` (`name`),
+    KEY `idx_node_merged` (`graph_no`, `graph_version`, `merged_into`, `deleted`)
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4
   COLLATE = utf8mb4_0900_ai_ci
@@ -54,6 +61,7 @@ CREATE TABLE IF NOT EXISTS `kg_graph_edge`
     `source_node_no` VARCHAR(191)    NOT NULL COMMENT '起点（引用 kg_graph_node.graph_node_no）',
     `target_node_no` VARCHAR(191)    NOT NULL COMMENT '终点（引用 kg_graph_node.graph_node_no）',
     `name`           VARCHAR(64)     NOT NULL DEFAULT '' COMMENT '关系标签（snake_case）',
+    `description`    TEXT            NULL COMMENT '关系描述',
     `properties`     JSON            NULL COMMENT '属性值兜底',
     `ref`            JSON            NULL COMMENT '来源指针 {docPath:[行范围]}',
     `deleted`        TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '软删除标志',
