@@ -10,10 +10,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 
 from .config import get_settings
-from .db import session_scope
+from .db import acquire_graph_write_lock, get_engine, session_scope
 from .models import DomainEntity
 
 
@@ -85,14 +85,34 @@ def seed_schema() -> int:
 
     Returns the number of newly inserted rows.
     """
+    # The shared ``kb`` database can already be on the later V6 ontology,
+    # where ``kg_domain_entity`` stores entity instances and intentionally no
+    # longer has the V2 type-definition columns.  The fixed V3 ontology still
+    # comes from this module, so skip persistence rather than issuing an
+    # incompatible ORM query against that newer table shape.
+    required_columns = {
+        "entity_name",
+        "cn_name",
+        "entity_type",
+        "core_schema",
+    }
+    columns = {column["name"] for column in inspect(get_engine()).get_columns("kg_domain_entity")}
+    if not required_columns.issubset(columns):
+        return 0
+
     settings = get_settings()
     inserted = 0
     with session_scope() as session:
-        existing = set(
-            session.execute(select(DomainEntity.entity_name)).scalars().all()
+        # V2's ``entity_name`` key is globally unique, so all graph versions
+        # share this seed catalogue and must serialize on one global lock row.
+        acquire_graph_write_lock(session, "__ontology__", 0)
+        existing_rows = list(
+            session.execute(select(DomainEntity)).scalars()
         )
+        existing = {row.entity_name: row for row in existing_rows}
         for t in NODE_TYPES:
             if t.name in existing:
+                existing[t.name].deleted = 0
                 continue
             session.add(
                 DomainEntity(
@@ -110,6 +130,7 @@ def seed_schema() -> int:
             inserted += 1
         for e in EDGE_TYPES:
             if e.name in existing:
+                existing[e.name].deleted = 0
                 continue
             session.add(
                 DomainEntity(
