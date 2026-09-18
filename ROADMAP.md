@@ -53,9 +53,9 @@
 
 | 能力 | 本项目文件 | 借鉴 |
 |---|---|---|
-| 本地 md/txt 按行号读取 | `src/ame_kb/ingest.py` | oceanai `addLineNumbers` |
-| 固定 schema + LLM 单步抽取 | `src/ame_kb/extract.py`、`schema.py`、`prompts/extract_v1.txt` | oceanai 抽取 prompt |
-| MySQL 三表（domain_entity/node/edge） | `sql/schema.sql`、`models.py` | oceanai_site 三表设计 |
+| 本地 md/txt 按行号读取 | `src/ame_kb/ingest.py` | 行号前缀便于抽取结果溯源 |
+| 固定 schema + LLM 单步抽取 | `src/ame_kb/extract.py`、`schema.py`、`prompts/extract_v1.txt` | 固定本体约束抽取结果 |
+| MySQL 三表（domain_entity/node/edge） | `sql/schema.sql`、`models.py` | 类型、节点、边分层存储 |
 | node_no=type:spec:slug(name)（Asset）/ type:slug(name)（其它）去重 | `src/ame_kb/store.py` | — |
 | 按名查询 + 一跳关系 | `src/ame_kb/query.py` | — |
 
@@ -65,9 +65,9 @@
 
 | 能力 | 本项目文件 | 借鉴 |
 |---|---|---|
-| md/txt/pdf/html loader | `src/ame_kb/sources.py` | oceanai「异构源归一成 doc」；`pypdf` / `trafilatura` |
+| md/txt/pdf/html loader | `src/ame_kb/sources.py` | 异构源统一转为文档；`pypdf` / `trafilatura` |
 | 半动态属性（properties JSON 兜底） | `extract.py: validate`、`prompts/extract_v2.txt` | `general_recall/core/entity/byterag_store.go:642` extractRAGTextFromProperties |
-| 内容 hash 增量跳过 | `store.py`、`sql/schema.sql`（kg_doc_version） | oceanai `saveIfChanged` |
+| 内容 hash 增量跳过 | `store.py`、`sql/schema.sql`（kg_doc_version） | 仅在正文变化时重新处理 |
 | 边置信标签 EXTRACTED/INFERRED/AMBIGUOUS | `extract.py` | Graphify 边 provenance |
 
 ---

@@ -1,10 +1,10 @@
 """Ingest: scan a folder for supported sources and prepare line-numbered documents.
 
 Source formats (md/txt/pdf/html) are normalized to plain text by `sources.load`
-before extraction (oceanai's "normalize every source into a doc" idea).
+before extraction.
 
-The line-number prefix ([N] ...) is borrowed from oceanai's addLineNumbers:
-it lets the LLM cite source line ranges when it extracts entities.
+The line-number prefix ([N] ...) lets the LLM cite source line ranges when it
+extracts entities.
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ class Document:
 
 
 def add_line_numbers(text: str) -> str:
-    """Prefix each line with [N] (1-based), mirroring oceanai's approach."""
+    """Prefix each line with [N] (1-based) for source-range citations."""
     lines = text.splitlines()
     return "\n".join(f"[{i}] {line}" for i, line in enumerate(lines, start=1))
 

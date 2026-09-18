@@ -15,8 +15,9 @@ nodes -- those seen in fewer than `resolve_prune_min_support` docs and touched
 by no live edge -- also snapshotted for rollback.
 
 Borrows: general_recall dual-channel KNN candidate retrieval + canonical
-node_no edge remap; oceanai_site's batch synonym clustering + low-support
-pruning; Graphiti's "return the most complete name" canonicalization.
+node_no edge remap; Graphiti's "return the most complete name"
+canonicalization. Batch synonym clustering and low-support pruning complete
+the entity-resolution workflow.
 """
 from __future__ import annotations
 

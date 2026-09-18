@@ -4,7 +4,7 @@
 
 目前已交付 V1～V5、V6.1 版本化基础，以及 V6.2 的持久化任务、后台 worker、逐文档 checkpoint、失败重试和进度查询。REST/MCP 和 UI 仍在后续 V6 阶段。
 
-核心表设计借鉴自 oceanai_site：
+核心表包括：
 - `kg_domain_entity`：类型定义层（schema），V1 由固定 schema 写入种子
 - `kg_graph_node`：实例节点
 - `kg_graph_edge`：实例边
@@ -135,7 +135,7 @@ MySQL 是任务状态的权威存储。默认 `PIPELINE_QUEUE_BACKEND=database` 
 
 ## 抽取机制
 
-- **多源接入（V2）**：`src/ame_kb/sources.py` 按后缀分发 loader，把 md/txt/pdf/html 统一转成纯文本 `Document`（借鉴 oceanai「异构源先归一化成 doc 再抽」）。PDF 用 `pypdf`，网页正文用 `trafilatura`。下游抽取路径与源格式无关。
+- **多源接入（V2）**：`src/ame_kb/sources.py` 按后缀分发 loader，把 md/txt/pdf/html 统一转成纯文本 `Document`。PDF 用 `pypdf`，网页正文用 `trafilatura`。下游抽取路径与源格式无关。
 - **固定本体分层 + 半动态属性（V7）**：节点/边的**类型**是一套固定的 site 式本体（`src/ame_kb/schema.py`，纯静态，不查库）：
   - 元类型（`GraphNode.type`，4 选 1）：`Asset / Relation / Event / Behavior`
   - Asset 的原型（`GraphNode.entity_spec`，5 选 1）：`Mission`（为什么做）/ `Solution`（怎么做）/ `Implementation`（静态产物）/ `ServiceInstance`（运行实例）/ `Artifact`（兜底成品）；非 Asset 节点 `entity_spec` 为 NULL。
@@ -144,20 +144,20 @@ MySQL 是任务状态的权威存储。默认 `PIPELINE_QUEUE_BACKEND=database` 
   - 但节点**属性**放开：本体之外，LLM 抽到的额外属性也全部保留进 `properties` JSON 兜底（不再像 V1 那样按白名单丢弃）。
 - **填空式抽取**：prompt（`src/ame_kb/prompts/extract_v2.txt`）把本体定义注入（`schema.schema_prompt_block`），让 LLM 只能输出上述元类型/原型，不能发明新类型。
 - **边置信标签（V2）**：每条边带 `confidence ∈ {EXTRACTED, INFERRED, AMBIGUOUS}`（借鉴 Graphify），存入 `kg_graph_edge.properties`。LLM 抽取默认 `INFERRED`；入库前校验非法置信值会被丢弃。
-- **行号来源**：文档每行加 `[N] ` 前缀（借鉴 oceanai `addLineNumbers`），LLM 在 `source` 里回填行范围，便于溯源。
+- **行号来源**：文档每行加 `[N] ` 前缀，LLM 在 `source` 里回填行范围，便于溯源。
 - **入库校验**：非法 `entity_type`、Asset 缺/错 `entity_spec`、端点不在本次节点集合、非法 `confidence` 都会被丢弃（`extract.py: validate`）。
 - **去重（V7 分层）**：Asset 的 `graph_node_no = type:entity_spec:slug(name)`，非 Asset 为 `type:slug(name)`。同名但不同原型的 Asset（如 `Login` 的 Mission/Solution/Implementation）是**不同节点**，可用关系串成价值链；精确同层同名在写入时天然合并（upsert）。跨文档「同实体不同写法」由 V5 的 `resolve` 融合处理。
-- **增量（V2）**：入库前算 `sha256(正文)` 与 `kg_doc_version` 中最新 hash 比对，未变则跳过抽取（借鉴 oceanai `saveIfChanged`）。hash 在**成功入库后**才记录，抽取失败不会污染缓存。`--force` 可绕过。
+- **增量（V2）**：入库前算 `sha256(正文)` 与 `kg_doc_version` 中最新 hash 比对，未变则跳过抽取。hash 在**成功入库后**才记录，抽取失败不会污染缓存。`--force` 可绕过。
 
 ## 实体融合（V5）
 
 `resolve` 把跨文档指向同一现实实体、但名字不同的节点合并为一个 canonical 主实体（`src/ame_kb/resolve.py`）：
 
 - **候选召回**：对每个节点用其 `name + description + properties` 走 `HybridIndex.search`（向量 KNN + 全文，RRF 融合，复用 V4 检索栈）拿相似候选，排除自身。范式借鉴 general_recall 的双通道候选召回。
-- **批量同义聚类**：把种子 + 其同一本体类型的候选一次性交给 LLM（`prompts/resolve_cluster.txt`），让它把「同一现实实体的不同命名」归为若干簇，每簇给出「更完整的规范名」（借鉴 oceanai_site 的批量归一 + Graphiti「返回最完整全名」）。相比逐对判定，单个种子只需一次 LLM 调用，数据量大时显著省 token。LLM/JSON 失败一律返回空（不合并），且只采用模型复用的已知名字（不接受新造名）。
+- **批量同义聚类**：把种子 + 其同一本体类型的候选一次性交给 LLM（`prompts/resolve_cluster.txt`），让它把「同一现实实体的不同命名」归为若干簇，每簇给出「更完整的规范名」（采用 Graphiti「返回最完整全名」的规范化方式）。相比逐对判定，单个种子只需一次 LLM 调用，数据量大时显著省 token。LLM/JSON 失败一律返回空（不合并），且只采用模型复用的已知名字（不接受新造名）。
 - **字段并集融合**：`properties` 主实体优先、被合并方补空缺；`ref`（溯源行号）按 doc_id 并集；`description` 取更完整的一个。
 - **边重挂 canonical**：被合并节点上的边端点改挂到主实体（借鉴 general_recall `node_retriever`）。重挂后若与既有边 `edge_no` 撞键则合并并去重；塌成自环的边丢弃。
-- **低支持度剪枝（可选，默认关闭）**：合并后可选做一遍长尾剪枝（借鉴 oceanai_site `pruneLowSupport`）：软删只出现在少于 `RESOLVE_PRUNE_MIN_SUPPORT` 篇文档（`len(ref)`）、且没有任何活跃边引用的噪声节点；被边引用的节点一律保护，避免打断真实关系。每次剪枝同样快照进 `kg_merge_log`（status=`PRUNED`），可 `rollback-merge` 还原。通过 `resolve --prune` 或 `RESOLVE_PRUNE_ENABLED=true` 开启。
+- **低支持度剪枝（可选，默认关闭）**：合并后可选做一遍长尾剪枝：软删只出现在少于 `RESOLVE_PRUNE_MIN_SUPPORT` 篇文档（`len(ref)`）、且没有任何活跃边引用的噪声节点；被边引用的节点一律保护，避免打断真实关系。每次剪枝同样快照进 `kg_merge_log`（status=`PRUNED`），可 `rollback-merge` 还原。通过 `resolve --prune` 或 `RESOLVE_PRUNE_ENABLED=true` 开启。
 - **别名 + 可回滚审计**：被合并方的名字（及被改名时主实体的旧名）写入 `kg_entity_alias`，reindex 时并进主实体的 `searchable_text`，于是**别名也能搜到主实体**；每次合并把 loser 全量 + 边端点原值快照进 `kg_merge_log`，`rollback-merge <merge_id>` 可完整还原。
 
 ## 数据库结构

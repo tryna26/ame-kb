@@ -1,8 +1,7 @@
 """Source loaders: turn heterogeneous files into plain text.
 
-Borrowed from oceanai's "normalize every source into a doc before extraction"
-idea: each loader takes a path and returns plain text, so the downstream
-Document / extraction path stays identical regardless of source format.
+Each loader takes a path and returns plain text, so the downstream Document /
+extraction path stays identical regardless of source format.
 """
 from __future__ import annotations
 
