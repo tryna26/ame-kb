@@ -1,18 +1,15 @@
-"""Canonical V3 entity lookup and one-hop relation queries."""
+"""Basic V1 queries: find entities by name, and list a node's direct relations."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 from sqlalchemy import or_, select
-from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .db import session_scope
-from .models import GraphEdge, GraphNode, LegacyNodeId, NodeAlias
-from .resolve import normalize_alias
-
-MAX_REDIRECT_HOPS = 32
+from .models import GraphEdge, GraphNode
+from .store import load_domain_map
 
 
 @dataclass
@@ -32,263 +29,176 @@ class RelationHit:
     other_type: str
 
 
-def _scope(model: object) -> Tuple[object, object]:
+@dataclass
+class GraphNodeDTO:
+    graph_node_no: str
+    name: str
+    type: str
+
+
+@dataclass
+class GraphEdgeDTO:
+    graph_edge_no: str
+    source_node_no: str
+    target_node_no: str
+    label: str
+
+
+@dataclass
+class GraphSnapshot:
+    nodes: List[GraphNodeDTO]
+    edges: List[GraphEdgeDTO]
+
+
+def graph_snapshot(limit: int = 2000) -> GraphSnapshot:
+    """Return the full node + edge set of the active graph version for
+    whole-graph visualization. Nodes are capped by ``limit``; edges are kept
+    only when both endpoints are within the returned node set.
+    """
     settings = get_settings()
-    return (
-        model.graph_no == settings.graph_no,
-        model.graph_version == settings.graph_version,
-    )
+    with session_scope() as session:
+        node_rows = (
+            session.execute(
+                select(GraphNode)
+                .where(
+                    GraphNode.graph_no == settings.graph_no,
+                    GraphNode.graph_version == settings.graph_version,
+                    GraphNode.deleted == 0,
+                )
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        node_nos = [r.graph_node_no for r in node_rows]
+        domain_map = load_domain_map(
+            session, settings.graph_no, settings.graph_version, node_nos
+        )
+        nodes = [
+            GraphNodeDTO(
+                r.graph_node_no,
+                r.name,
+                domain_map.get(r.graph_node_no, (r.type, None))[0],
+            )
+            for r in node_rows
+        ]
+        node_set = set(node_nos)
+        edge_rows = (
+            session.execute(
+                select(GraphEdge).where(
+                    GraphEdge.graph_no == settings.graph_no,
+                    GraphEdge.graph_version == settings.graph_version,
+                    GraphEdge.deleted == 0,
+                )
+            )
+            .scalars()
+            .all()
+        )
+        edges = [
+            GraphEdgeDTO(
+                e.graph_edge_no, e.source_node_no, e.target_node_no, e.name
+            )
+            for e in edge_rows
+            if e.source_node_no in node_set and e.target_node_no in node_set
+        ]
+        return GraphSnapshot(nodes=nodes, edges=edges)
 
 
-def _raw_node_by_no(session: Session, node_no: str) -> Optional[GraphNode]:
+def find_entities(name: str, limit: int = 20) -> List[NodeHit]:
+    settings = get_settings()
+    with session_scope() as session:
+        rows = (
+            session.execute(
+                select(GraphNode)
+                .where(
+                    GraphNode.graph_no == settings.graph_no,
+                    GraphNode.graph_version == settings.graph_version,
+                    GraphNode.deleted == 0,
+                    GraphNode.name.like(f"%{name}%"),
+                )
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        domain_map = load_domain_map(
+            session,
+            settings.graph_no,
+            settings.graph_version,
+            [r.graph_node_no for r in rows],
+        )
+        return [
+            NodeHit(
+                r.graph_node_no,
+                r.name,
+                domain_map.get(r.graph_node_no, (r.type, None))[0],
+                r.properties or {},
+            )
+            for r in rows
+        ]
+
+
+def _node_by_no(session, node_no: str) -> Optional[GraphNode]:
+    settings = get_settings()
     return session.execute(
         select(GraphNode).where(
-            *_scope(GraphNode),
+            GraphNode.graph_no == settings.graph_no,
+            GraphNode.graph_version == settings.graph_version,
             GraphNode.graph_node_no == node_no,
+            GraphNode.deleted == 0,
         )
     ).scalar_one_or_none()
 
 
-def resolve_node_identifier(
-    session: Session, identifier: str, max_hops: int = MAX_REDIRECT_HOPS
-) -> Optional[GraphNode]:
-    """Resolve a current or legacy Node ID to its live canonical survivor.
-
-    Current IDs take precedence over the legacy compatibility map. Unknown IDs
-    and terminal soft-deleted rows return ``None``. A redirect cycle or a chain
-    longer than ``max_hops`` is treated as corrupt data and raises ``ValueError``.
-    """
-
-    if max_hops < 0:
-        raise ValueError("max_hops must not be negative")
-    current_no = str(identifier or "").strip()
-    if not current_no:
-        return None
-
-    node = _raw_node_by_no(session, current_no)
-    if node is None:
-        mapped = session.execute(
-            select(LegacyNodeId.canonical_node_no).where(
-                *_scope(LegacyNodeId),
-                LegacyNodeId.legacy_node_no == current_no,
-            )
-        ).scalar_one_or_none()
-        if mapped is None:
-            return None
-        current_no = str(mapped)
-
-    visited = set()
-    redirects = 0
-    while True:
-        if current_no in visited:
-            raise ValueError(
-                f"merged_into cycle detected while resolving {identifier!r}"
-            )
-        visited.add(current_no)
-        node = _raw_node_by_no(session, current_no)
-        if node is None:
-            return None
-        merged_into = str(node.merged_into or "").strip()
-        if not merged_into:
-            return node if int(node.deleted or 0) == 0 else None
-        redirects += 1
-        if redirects > max_hops:
-            raise ValueError(
-                f"merged_into chain exceeds {max_hops} hop(s) for {identifier!r}"
-            )
-        current_no = merged_into
-
-
-def _as_hit(node: GraphNode) -> NodeHit:
-    return NodeHit(
-        graph_node_no=node.graph_node_no,
-        name=node.name,
-        type=node.type,
-        properties=node.properties or {},
-    )
-
-
-def find_entities(
-    name: str, limit: int = 20, type_filter: Optional[str] = None
-) -> List[NodeHit]:
-    """Find live canonical Nodes by name substring or alias substring.
-
-    Exact canonical-name and exact-alias matches sort before substring matches.
-    Alias rows are canonicalized defensively, so stale rows that still target a
-    merged loser return its survivor. Each survivor appears at most once.
-    """
-
-    query = str(name or "").strip()
-    if not query or limit <= 0:
-        return []
-    normalized = normalize_alias(query)
-
-    with session_scope() as session:
-        node_stmt = select(GraphNode).where(
-            *_scope(GraphNode),
-            GraphNode.deleted == 0,
-            GraphNode.merged_into.is_(None),
-            GraphNode.name.contains(query, autoescape=True),
-        )
-        if type_filter:
-            node_stmt = node_stmt.where(GraphNode.type == type_filter)
-        nodes = list(
-            session.execute(
-                node_stmt.order_by(GraphNode.name, GraphNode.graph_node_no)
-            )
-            .scalars()
-            .all()
-        )
-
-        alias_rows = []
-        if normalized:
-            alias_stmt = select(NodeAlias).where(
-                *_scope(NodeAlias),
-                NodeAlias.normalized_alias.contains(normalized, autoescape=True),
-            )
-            if type_filter:
-                alias_stmt = alias_stmt.where(NodeAlias.type == type_filter)
-            alias_rows = list(
-                session.execute(
-                    alias_stmt.order_by(NodeAlias.alias, NodeAlias.canonical_node_no)
-                )
-                .scalars()
-                .all()
-            )
-
-        ranked: Dict[str, Tuple[int, GraphNode]] = {}
-
-        def add(node: Optional[GraphNode], rank: int) -> None:
-            if node is None or node.merged_into or int(node.deleted or 0) != 0:
-                return
-            if type_filter and node.type != type_filter:
-                return
-            previous = ranked.get(node.graph_node_no)
-            if previous is None or rank < previous[0]:
-                ranked[node.graph_node_no] = (rank, node)
-
-        for node in nodes:
-            rank = 0 if normalize_alias(node.name) == normalized else 2
-            add(node, rank)
-        for alias in alias_rows:
-            node = resolve_node_identifier(session, alias.canonical_node_no)
-            rank = 1 if alias.normalized_alias == normalized else 3
-            add(node, rank)
-
-        ordered = sorted(
-            ranked.values(),
-            key=lambda item: (
-                item[0],
-                item[1].name.casefold(),
-                item[1].graph_node_no,
-            ),
-        )
-        return [_as_hit(node) for _rank, node in ordered[:limit]]
-
-
-def find_entities_exact(type_: str, name: str) -> List[NodeHit]:
-    """Return canonical Nodes whose type and name/alias exactly match.
-
-    This powers the compatibility ``node-no`` CLI. It performs a lookup and
-    never derives a synthetic identity from the supplied name.
-    """
-
-    type_value = str(type_ or "").strip()
-    name_value = str(name or "").strip()
-    normalized = normalize_alias(name_value)
-    if not type_value or not name_value or not normalized:
-        return []
-
-    with session_scope() as session:
-        nodes = list(
-            session.execute(
-                select(GraphNode)
-                .where(
-                    *_scope(GraphNode),
-                    GraphNode.deleted == 0,
-                    GraphNode.merged_into.is_(None),
-                    GraphNode.type == type_value,
-                    GraphNode.name == name_value,
-                )
-                .order_by(GraphNode.graph_node_no)
-            )
-            .scalars()
-            .all()
-        )
-        aliases = (
-            session.execute(
-                select(NodeAlias)
-                .where(
-                    *_scope(NodeAlias),
-                    NodeAlias.type == type_value,
-                    NodeAlias.normalized_alias == normalized,
-                )
-                .order_by(NodeAlias.canonical_node_no)
-            )
-            .scalars()
-            .all()
-        )
-        by_no: Dict[str, GraphNode] = {node.graph_node_no: node for node in nodes}
-        for alias in aliases:
-            node = resolve_node_identifier(session, alias.canonical_node_no)
-            if node is not None and node.type == type_value:
-                by_no[node.graph_node_no] = node
-        return [_as_hit(by_no[node_no]) for node_no in sorted(by_no)]
-
-
-def _node_by_no(session: Session, node_no: str) -> Optional[GraphNode]:
-    """Backward-compatible internal helper returning a canonical Node."""
-
-    return resolve_node_identifier(session, node_no)
-
-
 def relations_of(node_no: str) -> List[RelationHit]:
-    """Return direct relations for a current, legacy, or merged Node ID."""
-
+    """Return the direct (one-hop) relations of a node identified by graph_node_no."""
+    settings = get_settings()
     hits: List[RelationHit] = []
     with session_scope() as session:
-        node = resolve_node_identifier(session, node_no)
-        if node is None:
-            return []
-        canonical_no = node.graph_node_no
         edges = (
             session.execute(
-                select(GraphEdge)
-                .where(
-                    *_scope(GraphEdge),
+                select(GraphEdge).where(
+                    GraphEdge.graph_no == settings.graph_no,
+                    GraphEdge.graph_version == settings.graph_version,
                     GraphEdge.deleted == 0,
                     or_(
-                        GraphEdge.source_node_no == canonical_no,
-                        GraphEdge.target_node_no == canonical_no,
+                        GraphEdge.source_node_no == node_no,
+                        GraphEdge.target_node_no == node_no,
                     ),
                 )
-                .order_by(GraphEdge.id, GraphEdge.graph_edge_no)
             )
             .scalars()
             .all()
         )
-        seen = set()
-        for edge in edges:
-            if edge.source_node_no == canonical_no:
+        other_nos = [
+            e.target_node_no if e.source_node_no == node_no else e.source_node_no
+            for e in edges
+        ]
+        domain_map = load_domain_map(
+            session,
+            settings.graph_no,
+            settings.graph_version,
+            other_nos,
+        )
+        for e in edges:
+            if e.source_node_no == node_no:
+                other = _node_by_no(session, e.target_node_no)
                 direction = "out"
-                other_identifier = edge.target_node_no
+                other_no = e.target_node_no
             else:
+                other = _node_by_no(session, e.source_node_no)
                 direction = "in"
-                other_identifier = edge.source_node_no
-            other = resolve_node_identifier(session, other_identifier)
-            if other is None or other.graph_node_no == canonical_no:
-                continue
-            key = (direction, edge.name, other.graph_node_no)
-            if key in seen:
-                continue
-            seen.add(key)
+                other_no = e.source_node_no
+            other_type = "?"
+            if other is not None:
+                other_type = domain_map.get(other_no, (other.type, None))[0]
             hits.append(
                 RelationHit(
                     direction=direction,
-                    label=edge.name,
-                    other_no=other.graph_node_no,
-                    other_name=other.name,
-                    other_type=other.type,
+                    label=e.name,
+                    other_no=other_no,
+                    other_name=other.name if other else "(missing)",
+                    other_type=other_type,
                 )
             )
     return hits

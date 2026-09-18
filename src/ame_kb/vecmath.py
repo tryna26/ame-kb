@@ -1,56 +1,21 @@
-"""Small, strict vector helpers used by entity resolution.
+"""Pure vector math shared by the MySQL search backend and recall tests.
 
-The resolver treats a malformed embedding as data corruption rather than as a
-zero-similarity candidate.  Keeping that rule here gives callers one shared
-validation boundary.
+Kept dependency-free so both `recall` and `searchbackend.mysql` can import it
+without creating an import cycle.
 """
 from __future__ import annotations
 
 import math
-from numbers import Real
-from typing import Optional, Sequence
-
-
-def validate_vector(
-    vector: Sequence[float], *, dimension: Optional[int] = None
-) -> None:
-    """Raise ``ValueError`` unless *vector* is non-empty and finite.
-
-    ``bool`` is deliberately rejected even though it is an ``int`` subclass:
-    accepting ``true`` in an embedding JSON value hides provider/schema bugs.
-    """
-
-    if not vector:
-        raise ValueError("embedding vector must not be empty")
-    if dimension is not None and len(vector) != dimension:
-        raise ValueError(
-            f"embedding dimension mismatch: expected {dimension}, got {len(vector)}"
-        )
-    for index, value in enumerate(vector):
-        if isinstance(value, bool) or not isinstance(value, Real):
-            raise ValueError(f"embedding[{index}] is not a number")
-        if not math.isfinite(float(value)):
-            raise ValueError(f"embedding[{index}] is not finite")
+from typing import Sequence
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    """Return cosine similarity for two valid equal-length vectors.
-
-    Dimension mismatches, non-finite values, empty vectors, and zero-norm
-    vectors are invalid inputs and raise ``ValueError``.  Silent ``0`` fallbacks
-    would turn a broken embedding response into a misleading resolution result.
-    """
-
-    validate_vector(a)
-    validate_vector(b, dimension=len(a))
-    dot = math.fsum(float(x) * float(y) for x, y in zip(a, b))
-    norm_a = math.sqrt(math.fsum(float(x) * float(x) for x in a))
-    norm_b = math.sqrt(math.fsum(float(y) * float(y) for y in b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        raise ValueError("cosine is undefined for a zero-norm vector")
-    result = dot / (norm_a * norm_b)
-    if not math.isfinite(result):
-        raise ValueError("cosine result is not finite")
-    # Floating point round-off can escape the mathematical [-1, 1] range by a
-    # few ulps.  Clamp only after all validity checks have passed.
-    return max(-1.0, min(1.0, result))
+    """Cosine similarity of two equal-length vectors; 0 if either is empty/zero."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)

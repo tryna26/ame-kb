@@ -1,8 +1,7 @@
 """Source loaders: turn heterogeneous files into plain text.
 
-Borrowed from oceanai's "normalize every source into a doc before extraction"
-idea: each loader takes a path and returns plain text, so the downstream
-Document / extraction path stays identical regardless of source format.
+Each loader takes a path and returns plain text, so the downstream Document /
+extraction path stays identical regardless of source format.
 """
 from __future__ import annotations
 
@@ -52,3 +51,19 @@ def load(path: Path) -> str:
     if loader is None:
         raise ValueError(f"Unsupported source type: {path.suffix} ({path})")
     return loader(path)
+
+
+def fetch_url(url: str, timeout: float = 30.0) -> str:
+    """Fetch a web page and return its main-content text.
+
+    Uses trafilatura's own fetch (handles encoding/redirects) then main-content
+    extraction, the same extractor used for local .html files, so URL and file
+    sources normalize to identical downstream text.
+    """
+    import trafilatura
+
+    downloaded = trafilatura.fetch_url(url)
+    if not downloaded:
+        raise ValueError(f"Failed to fetch URL: {url}")
+    extracted = trafilatura.extract(downloaded)
+    return extracted or ""

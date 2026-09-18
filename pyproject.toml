@@ -1,7 +1,7 @@
 [project]
 name = "ame-kb"
 version = "0.1.0"
-description = "Minimal knowledge-graph builder: ingest docs -> LLM extract -> MySQL (nodes/edges/schema)"
+description = "Versioned knowledge-recall and agent-memory core with hybrid graph search"
 requires-python = ">=3.9"
 dependencies = [
     "SQLAlchemy>=2.0",
@@ -13,6 +13,11 @@ dependencies = [
     "pypdf>=4.0",
     "trafilatura>=1.8",
 ]
+
+[project.optional-dependencies]
+redis = ["redis>=5.0"]
+api = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9"]
+code = ["tree-sitter>=0.23,<0.24", "tree-sitter-python>=0.23", "tree-sitter-go>=0.23"]
 
 [project.scripts]
 ame-kb = "ame_kb.cli:app"
@@ -26,3 +31,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "ame_kb.prompts" = ["*.txt"]
+"ame_kb.web" = ["*.html"]

@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ame-kb</title>
+<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #262b36; --fg: #e6e9ef;
+    --muted: #8b93a7; --accent: #4f8cff; --accent-dim: #2b3550;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --chip: #222836;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+    border-bottom: 1px solid var(--border); background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .grow { flex: 1; }
+  select, input, button, textarea {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; font: inherit; outline: none;
+  }
+  select:focus, input:focus, textarea:focus { border-color: var(--accent); }
+  button {
+    background: var(--accent-dim); border-color: var(--accent-dim);
+    cursor: pointer; transition: background .12s;
+  }
+  button:hover { background: var(--accent); border-color: var(--accent); }
+  button.ghost { background: transparent; border-color: var(--border); }
+  button.ghost:hover { background: var(--chip); border-color: var(--muted); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .tabs { display: flex; gap: 4px; padding: 0 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  .tab { padding: 10px 14px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; }
+  .tab.active { color: var(--fg); border-bottom-color: var(--accent); }
+  main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+  .view { display: none; }
+  .view.active { display: block; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+  .card h3 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .muted { color: var(--muted); }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--chip); font-size: 12px; color: var(--muted); margin-right: 6px; }
+  .chip.type { background: var(--accent-dim); color: #cfe0ff; }
+  .node { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; background: var(--bg); }
+  .node .name { font-weight: 600; }
+  .node .desc { color: var(--muted); margin-top: 4px; }
+  .edge { font-size: 13px; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+  .edge .lbl { color: var(--accent); }
+  pre.evidence { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; overflow-x: auto; white-space: pre-wrap; font-size: 12.5px; }
+  .lineno { color: var(--muted); user-select: none; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .status { font-size: 12px; padding: 1px 8px; border-radius: 999px; }
+  .status.SUCCEEDED, .status.ACTIVE { background: rgba(63,185,80,.15); color: var(--ok); }
+  .status.RUNNING, .status.QUEUED, .status.BUILDING { background: rgba(210,153,34,.15); color: var(--warn); }
+  .status.FAILED { background: rgba(248,81,73,.15); color: var(--err); }
+  .grow { flex: 1; }
+  .toast { position: fixed; bottom: 20px; right: 20px; background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 8px; padding: 12px 16px; max-width: 360px; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+  .toast.err { border-left-color: var(--err); }
+  .toast.ok { border-left-color: var(--ok); }
+  .trace { font-size: 12px; color: var(--muted); display: flex; gap: 14px; flex-wrap: wrap; }
+  .trace b { color: var(--fg); font-weight: 600; }
+  .dropzone { border: 1.5px dashed var(--border); border-radius: 10px; padding: 28px; text-align: center; color: var(--muted); cursor: pointer; }
+  .dropzone.over { border-color: var(--accent); color: var(--fg); background: var(--accent-dim); }
+  .filelist li { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid var(--border); }
+  a { color: var(--accent); }
+  /* graph explorer */
+  .graph-wrap { display: flex; gap: 14px; height: calc(100vh - 160px); min-height: 480px; }
+  .graph-side { width: 300px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
+  .graph-main { flex: 1; position: relative; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  #cy { width: 100%; height: 100%; }
+  .graph-hint { position: absolute; top: 10px; left: 12px; font-size: 12px; color: var(--muted); pointer-events: none; }
+  .graph-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); text-align: center; padding: 20px; }
+  .detail dl { margin: 0; }
+  .detail dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-top: 8px; }
+  .detail dd { margin: 2px 0 0; word-break: break-word; }
+  .hit-item { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px; cursor: pointer; background: var(--bg); }
+  .hit-item:hover { border-color: var(--accent); }
+  .hit-item .name { font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ame-kb</h1>
+  <span class="muted">知识库</span>
+  <select id="graphSel" title="当前知识库"></select>
+  <button class="ghost" id="newGraphBtn">+ 新建</button>
+  <span class="grow"></span>
+  <span class="muted" id="graphMeta"></span>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-view="ask">提问</div>
+  <div class="tab" data-view="data">喂数据</div>
+  <div class="tab" data-view="tasks">构建任务</div>
+  <div class="tab" data-view="entities">实体浏览</div>
+</div>
+
+<main>
+  <!-- ASK -->
+  <section class="view active" id="view-ask">
+    <div class="card">
+      <div class="row">
+        <input class="grow" id="askInput" placeholder="向当前知识库提问，例如：Project Aurora 向量化执行" />
+        <label class="muted"><input type="checkbox" id="askTrace" checked /> 召回解释</label>
+        <button id="askBtn">提问</button>
+      </div>
+    </div>
+    <div id="askTrace-box" class="card" style="display:none">
+      <h3>召回解释 (trace)</h3>
+      <div class="trace" id="traceBody"></div>
+    </div>
+    <div id="askResults"></div>
+  </section>
+
+  <!-- DATA -->
+  <section class="view" id="view-data">
+    <div class="card">
+      <h3>上传文档到当前知识库</h3>
+      <div class="dropzone" id="dropzone">
+        拖拽文件到此，或点击选择<br />
+        <span class="muted">支持 .md .txt .pdf .html</span>
+        <input type="file" id="fileInput" multiple accept=".md,.txt,.pdf,.html,.htm" hidden />
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="uploadBtn" disabled>上传</button>
+        <button class="ghost" id="ingestBtn">开始构建 (ingest)</button>
+        <span class="muted" id="uploadMeta"></span>
+      </div>
+    </div>
+    <div class="card">
+      <h3>当前清单</h3>
+      <ul class="filelist" id="fileList"><li class="muted">加载中…</li></ul>
+    </div>
+  </section>
+
+  <!-- TASKS -->
+  <section class="view" id="view-tasks">
+    <div class="card">
+      <div class="row">
+        <h3 style="margin:0">构建任务</h3>
+        <span class="grow"></span>
+        <label class="muted"><input type="checkbox" id="taskAuto" /> 自动刷新</label>
+        <button class="ghost" id="taskRefresh">刷新</button>
+      </div>
+      <table>
+        <thead><tr><th>任务</th><th>状态</th><th>进度</th><th>版本</th><th>错误</th><th></th></tr></thead>
+        <tbody id="taskBody"><tr><td colspan="6" class="muted">暂无任务</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ENTITIES -->
+  <section class="view" id="view-entities">
+    <div class="graph-wrap">
+      <div class="graph-side">
+        <div class="card">
+          <div class="row">
+            <input class="grow" id="entInput" placeholder="高亮实体，如 Ada" />
+            <button id="entBtn">高亮</button>
+          </div>
+          <div id="entHits" style="margin-top:10px"></div>
+        </div>
+        <div class="card detail" id="entDetail">
+          <h3>详情</h3>
+          <div class="muted">点击图中节点或边查看详情。</div>
+        </div>
+        <div class="card">
+          <button class="ghost" id="graphReset" style="width:100%">重置高亮 / 视图</button>
+        </div>
+      </div>
+      <div class="graph-main">
+        <div id="cy"></div>
+        <div class="graph-hint">拖动平移 · 滚轮缩放 · 单击节点看邻居 · 单击边看关系</div>
+        <div class="graph-empty" id="graphEmpty">加载图谱中…</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const api = {
+  async req(method, path, body, isForm) {
+    const opt = { method, headers: {} };
+    if (body !== undefined) {
+      if (isForm) { opt.body = body; }
+      else { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+    }
+    const r = await fetch(path, opt);
+    const text = await r.text();
+    const data = text ? JSON.parse(text) : null;
+    if (!r.ok) throw new Error((data && data.detail) || r.statusText);
+    return data;
+  },
+  graphs: () => api.req('GET', '/graphs'),
+  createGraph: (name) => api.req('POST', '/graphs', { name }),
+  files: (g) => api.req('GET', `/graphs/${g}/files`),
+  search: (b) => api.req('POST', '/search', b),
+  upload: (g, form) => api.req('POST', `/graphs/${g}/upload`, form, true),
+  ingest: (g) => api.req('POST', `/graphs/${g}/ingest`, {}),
+  tasks: (g) => api.req('GET', `/tasks?graph_no=${encodeURIComponent(g)}&limit=20`),
+  retry: (t) => api.req('POST', `/tasks/${t}/retry`, {}),
+  entities: (g, name) => api.req('GET', `/graphs/${g}/entities?name=${encodeURIComponent(name)}&limit=20`),
+  relations: (g, no) => api.req('GET', `/graphs/${g}/entities/${encodeURIComponent(no)}/relations`),
+  snapshot: (g) => api.req('GET', `/graphs/${g}/snapshot`),
+};
+
+let CURRENT = null;
+let pendingFiles = [];
+let cy = null;
+let graphLoadedFor = null;
+
+function toast(msg, kind) {
+  const t = document.createElement('div');
+  t.className = 'toast ' + (kind || '');
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+const esc = (s) => (s == null ? '' : String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])));
+
+// ---- tabs ----
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.onclick = () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('view-' + tab.dataset.view).classList.add('active');
+    if (tab.dataset.view === 'data') loadFiles();
+    if (tab.dataset.view === 'tasks') loadTasks();
+    if (tab.dataset.view === 'entities') loadFullGraph();
+  };
+});
+
+// ---- graph selector ----
+async function loadGraphs() {
+  try {
+    const gs = await api.graphs();
+    const sel = document.getElementById('graphSel');
+    sel.innerHTML = '';
+    if (!gs.length) {
+      sel.innerHTML = '<option value="">（无，请新建）</option>';
+      CURRENT = null;
+      document.getElementById('graphMeta').textContent = '';
+      return;
+    }
+    gs.forEach(g => {
+      const o = document.createElement('option');
+      o.value = g.graph_no;
+      o.textContent = `${g.name || g.graph_no} · v${g.graph_version} · ${g.status}`;
+      o.dataset.status = g.status;
+      sel.appendChild(o);
+    });
+    CURRENT = CURRENT && gs.find(g => g.graph_no === CURRENT) ? CURRENT : gs[0].graph_no;
+    sel.value = CURRENT;
+    updateMeta();
+  } catch (e) { toast('加载知识库失败: ' + e.message, 'err'); }
+}
+function updateMeta() {
+  const sel = document.getElementById('graphSel');
+  document.getElementById('graphMeta').textContent = CURRENT ? CURRENT : '';
+}
+document.getElementById('graphSel').onchange = (e) => {
+  CURRENT = e.target.value; updateMeta();
+  graphLoadedFor = null;
+  if (document.getElementById('view-entities').classList.contains('active')) loadFullGraph(true);
+};
+document.getElementById('newGraphBtn').onclick = async () => {
+  const name = prompt('新知识库名称？');
+  if (!name) return;
+  try {
+    const r = await api.createGraph(name);
+    CURRENT = r.graph_no;
+    toast('已创建 ' + r.graph_no, 'ok');
+    await loadGraphs();
+  } catch (e) { toast('创建失败: ' + e.message, 'err'); }
+};
+
+// ---- ASK ----
+async function doAsk() {
+  const q = document.getElementById('askInput').value.trim();
+  if (!q) return;
+  if (!CURRENT) { toast('请先选择或新建知识库', 'err'); return; }
+  const trace = document.getElementById('askTrace').checked;
+  const btn = document.getElementById('askBtn');
+  btn.disabled = true; btn.textContent = '召回中…';
+  const box = document.getElementById('askResults');
+  box.innerHTML = '<div class="card muted">召回中…</div>';
+  try {
+    const res = await api.search({ query: q, graph_no: CURRENT, trace });
+    renderTrace(res.session);
+    renderRecall(res);
+  } catch (e) {
+    box.innerHTML = '';
+    toast('召回失败: ' + e.message, 'err');
+  } finally { btn.disabled = false; btn.textContent = '提问'; }
+}
+function renderTrace(s) {
+  const wrap = document.getElementById('askTrace-box');
+  if (!s) { wrap.style.display = 'none'; return; }
+  wrap.style.display = 'block';
+  document.getElementById('traceBody').innerHTML = [
+    ['向量可用', s.embedding_available ? '是' : '否'],
+    ['改写 query', (s.queries || []).length],
+    ['重试档位', s.tier_used],
+    ['候选池', s.pool_size],
+    ['seeds', s.seed_count],
+    ['邻居', s.neighbor_count],
+    ['边', s.edge_count],
+    ['证据行', s.evidence_count],
+    ['doc_chunk', s.doc_chunk_count],
+  ].map(([k, v]) => `<span>${k} <b>${esc(v)}</b></span>`).join('');
+}
+function nodeCard(n) {
+  const spec = n.entity_spec ? `<span class="chip">${esc(n.entity_spec)}</span>` : '';
+  return `<div class="node"><div class="name">${esc(n.name)} <span class="chip type">${esc(n.type)}</span>${spec}</div>`
+    + (n.description ? `<div class="desc">${esc(n.description)}</div>` : '') + `</div>`;
+}
+function renderRecall(res) {
+  const box = document.getElementById('askResults');
+  const parts = [];
+  if (res.warnings && res.warnings.length)
+    parts.push(`<div class="card"><span class="chip" style="color:var(--warn)">警告</span> ${res.warnings.map(esc).join('；')}</div>`);
+  if (res.seeds && res.seeds.length)
+    parts.push(`<div class="card"><h3>命中实体 (${res.seeds.length})</h3>${res.seeds.map(nodeCard).join('')}</div>`);
+  if (res.neighbors && res.neighbors.length)
+    parts.push(`<div class="card"><h3>邻居 (${res.neighbors.length})</h3>${res.neighbors.map(nodeCard).join('')}</div>`);
+  if (res.edges && res.edges.length)
+    parts.push(`<div class="card"><h3>关系 (${res.edges.length})</h3>${res.edges.map(e =>
+      `<div class="edge">${esc(e.source_node_no)} <span class="lbl">—[${esc(e.label)}]→</span> ${esc(e.target_node_no)}</div>`).join('')}</div>`);
+  if (res.evidence && res.evidence.length) {
+    const txt = res.evidence.map(l => `<span class="lineno">${esc(l.doc_no)}:${l.line_no}</span>  ${esc(l.content)}`).join('\n');
+    parts.push(`<div class="card"><h3>原文证据 (${res.evidence.length})</h3><pre class="evidence">${txt}</pre></div>`);
+  }
+  if (res.doc_chunks && res.doc_chunks.length)
+    parts.push(`<div class="card"><h3>文档片段 (${res.doc_chunks.length})</h3>${res.doc_chunks.map(c =>
+      `<div class="node"><div class="desc"><span class="lineno">${esc(c.doc_no)} [${c.line_start}-${c.line_end}]</span></div><div>${esc(c.content)}</div></div>`).join('')}</div>`);
+  box.innerHTML = parts.length ? parts.join('') : '<div class="card muted">没有召回到结果。</div>';
+}
+document.getElementById('askBtn').onclick = doAsk;
+document.getElementById('askInput').addEventListener('keydown', e => { if (e.key === 'Enter') doAsk(); });
+
+// ---- DATA ----
+const dz = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+dz.onclick = () => fileInput.click();
+dz.ondragover = (e) => { e.preventDefault(); dz.classList.add('over'); };
+dz.ondragleave = () => dz.classList.remove('over');
+dz.ondrop = (e) => { e.preventDefault(); dz.classList.remove('over'); addPending(e.dataTransfer.files); };
+fileInput.onchange = () => addPending(fileInput.files);
+function addPending(list) {
+  pendingFiles = pendingFiles.concat(Array.from(list));
+  document.getElementById('uploadBtn').disabled = pendingFiles.length === 0;
+  document.getElementById('uploadMeta').textContent = pendingFiles.length ? `待上传 ${pendingFiles.length} 个文件` : '';
+}
+document.getElementById('uploadBtn').onclick = async () => {
+  if (!CURRENT) { toast('请先选择知识库', 'err'); return; }
+  if (!pendingFiles.length) return;
+  const form = new FormData();
+  pendingFiles.forEach(f => form.append('files', f, f.name));
+  try {
+    const r = await api.upload(CURRENT, form);
+    toast(`已上传，新增 ${r.added.length} 个文档`, 'ok');
+    pendingFiles = [];
+    document.getElementById('uploadBtn').disabled = true;
+    document.getElementById('uploadMeta').textContent = '';
+    loadFiles();
+  } catch (e) { toast('上传失败: ' + e.message, 'err'); }
+};
+document.getElementById('ingestBtn').onclick = async () => {
+  if (!CURRENT) { toast('请先选择知识库', 'err'); return; }
+  try {
+    const r = await api.ingest(CURRENT);
+    toast('已入队构建任务 ' + (r.task_no || ''), 'ok');
+    document.querySelector('.tab[data-view="tasks"]').click();
+  } catch (e) { toast('入队失败: ' + e.message, 'err'); }
+};
+async function loadFiles() {
+  const ul = document.getElementById('fileList');
+  if (!CURRENT) { ul.innerHTML = '<li class="muted">请先选择知识库</li>'; return; }
+  try {
+    const fs = await api.files(CURRENT);
+    ul.innerHTML = fs.length ? fs.map(f =>
+      `<li><span>${esc(f.doc_no)}</span><span class="chip">${esc(f.source_type)}</span></li>`).join('')
+      : '<li class="muted">清单为空，先上传文件</li>';
+  } catch (e) { ul.innerHTML = `<li class="muted">加载失败: ${esc(e.message)}</li>`; }
+}
+
+// ---- TASKS ----
+let taskTimer = null;
+async function loadTasks() {
+  const tb = document.getElementById('taskBody');
+  if (!CURRENT) { tb.innerHTML = '<tr><td colspan="6" class="muted">请先选择知识库</td></tr>'; return; }
+  try {
+    const ts = await api.tasks(CURRENT);
+    tb.innerHTML = ts.length ? ts.map(t => {
+      const prog = t.progress_total ? `${t.progress_current}/${t.progress_total}` : '-';
+      const ver = t.run && t.run.target_version ? `v${t.run.target_version}` : '-';
+      const retry = t.status === 'FAILED' ? `<button class="ghost" data-retry="${esc(t.task_no)}">重试</button>` : '';
+      return `<tr><td>${esc(t.task_no)}</td><td><span class="status ${esc(t.status)}">${esc(t.status)}</span></td>`
+        + `<td>${prog}</td><td>${ver}</td><td class="muted">${esc(t.error || '')}</td><td>${retry}</td></tr>`;
+    }).join('') : '<tr><td colspan="6" class="muted">暂无任务</td></tr>';
+    tb.querySelectorAll('button[data-retry]').forEach(el => {
+      el.onclick = () => retryTask(el.dataset.retry);
+    });
+  } catch (e) { tb.innerHTML = `<tr><td colspan="6" class="muted">加载失败: ${esc(e.message)}</td></tr>`; }
+}
+window.retryTask = async (t) => {
+  try { await api.retry(t); toast('已重新入队', 'ok'); loadTasks(); }
+  catch (e) { toast('重试失败: ' + e.message, 'err'); }
+};
+document.getElementById('taskRefresh').onclick = loadTasks;
+document.getElementById('taskAuto').onchange = (e) => {
+  if (e.target.checked) { taskTimer = setInterval(loadTasks, 3000); loadTasks(); }
+  else { clearInterval(taskTimer); taskTimer = null; }
+};
+
+// ---- ENTITIES (graph explorer) ----
+const TYPE_COLORS = { Asset: '#4f8cff', Relation: '#d29922', Event: '#3fb950', Behavior: '#c678dd' };
+
+function ensureCy() {
+  if (cy) return cy;
+  cy = cytoscape({
+    container: document.getElementById('cy'),
+    minZoom: 0.1, maxZoom: 3,
+    style: [
+      { selector: 'node', style: {
+        'background-color': (n) => TYPE_COLORS[n.data('type')] || '#8b93a7',
+        'label': 'data(name)', 'color': '#e6e9ef', 'font-size': 11,
+        'text-valign': 'bottom', 'text-margin-y': 4, 'width': 24, 'height': 24,
+        'text-outline-color': '#0f1115', 'text-outline-width': 2 } },
+      { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#4f8cff' } },
+      { selector: 'node.match', style: {
+        'width': 40, 'height': 40, 'border-width': 3, 'border-color': '#fff',
+        'font-size': 13, 'font-weight': 'bold' } },
+      { selector: 'edge', style: {
+        'width': 1.5, 'line-color': '#3a4152', 'target-arrow-color': '#3a4152',
+        'target-arrow-shape': 'triangle', 'curve-style': 'bezier',
+        'label': 'data(label)', 'font-size': 9, 'color': '#8b93a7',
+        'text-rotation': 'autorotate', 'text-background-color': '#0f1115',
+        'text-background-opacity': 1, 'text-background-padding': 2 } },
+      { selector: 'edge:selected', style: { 'line-color': '#4f8cff', 'target-arrow-color': '#4f8cff', 'width': 2.5 } },
+      { selector: '.dim', style: { 'opacity': 0.12 } },
+    ],
+  });
+  cy.on('tap', 'node', (e) => showNodeDetail(e.target.data()));
+  cy.on('tap', 'edge', (e) => showEdgeDetail(e.target.data()));
+  cy.on('tap', (e) => { if (e.target === cy) clearHighlight(); });
+  return cy;
+}
+
+function showNodeDetail(d) {
+  document.getElementById('entDetail').innerHTML =
+    `<h3>节点</h3><dl>`
+    + `<dt>名称</dt><dd>${esc(d.name)}</dd>`
+    + `<dt>类型</dt><dd><span class="chip type">${esc(d.type)}</span></dd>`
+    + `<dt>node_no</dt><dd class="muted">${esc(d.id)}</dd>`
+    + `</dl>`;
+}
+function showEdgeDetail(d) {
+  document.getElementById('entDetail').innerHTML =
+    `<h3>关系</h3><dl>`
+    + `<dt>源</dt><dd>${esc(d.srcName || d.source)}</dd>`
+    + `<dt>关系</dt><dd><span class="lbl">—[${esc(d.label)}]→</span></dd>`
+    + `<dt>目标</dt><dd>${esc(d.tgtName || d.target)}</dd>`
+    + `</dl>`;
+}
+
+async function loadFullGraph(force) {
+  if (!CURRENT) {
+    document.getElementById('graphEmpty').textContent = '请先选择知识库';
+    document.getElementById('graphEmpty').style.display = 'flex';
+    return;
+  }
+  ensureCy();
+  cy.resize();
+  if (graphLoadedFor === CURRENT && !force) { cy.fit(undefined, 40); return; }
+  const empty = document.getElementById('graphEmpty');
+  empty.textContent = '加载图谱中…'; empty.style.display = 'flex';
+  try {
+    const snap = await api.snapshot(CURRENT);
+    cy.elements().remove();
+    const nameOf = {};
+    snap.nodes.forEach(n => { nameOf[n.graph_node_no] = n.name; });
+    const els = [];
+    snap.nodes.forEach(n => els.push({ group: 'nodes', data: { id: n.graph_node_no, name: n.name || n.graph_node_no, type: n.type || '' } }));
+    snap.edges.forEach(e => els.push({ group: 'edges', data: {
+      id: e.graph_edge_no, source: e.source_node_no, target: e.target_node_no, label: e.label,
+      srcName: nameOf[e.source_node_no], tgtName: nameOf[e.target_node_no] } }));
+    cy.add(els);
+    cy.layout({ name: 'cose', animate: false, nodeRepulsion: 8000, idealEdgeLength: 90, padding: 30 }).run();
+    cy.fit(undefined, 40);
+    graphLoadedFor = CURRENT;
+    if (!snap.nodes.length) { empty.textContent = '该知识库还没有实体，先去「喂数据」构建。'; empty.style.display = 'flex'; }
+    else { empty.style.display = 'none'; }
+  } catch (e) {
+    empty.textContent = '加载失败: ' + e.message; empty.style.display = 'flex';
+  }
+}
+
+function clearHighlight() {
+  if (!cy) return;
+  cy.elements().removeClass('dim').removeClass('match');
+  document.getElementById('entHits').innerHTML = '';
+}
+
+async function doEntity() {
+  const name = document.getElementById('entInput').value.trim();
+  if (!CURRENT) { toast('请先选择知识库', 'err'); return; }
+  await loadFullGraph();
+  if (!name) { clearHighlight(); return; }
+  const box = document.getElementById('entHits');
+  box.innerHTML = '<div class="muted">匹配中…</div>';
+  try {
+    const hits = await api.entities(CURRENT, name);
+    if (!hits.length) {
+      box.innerHTML = '<div class="muted">没有匹配的实体。</div>';
+      cy.elements().removeClass('dim').removeClass('match');
+      return;
+    }
+    const matchIds = new Set(hits.map(h => h.graph_node_no));
+    const matched = cy.nodes().filter(n => matchIds.has(n.id()));
+    const neighborhood = matched.closedNeighborhood();
+    cy.elements().addClass('dim');
+    neighborhood.removeClass('dim');
+    cy.nodes().removeClass('match');
+    matched.addClass('match');
+    if (matched.length) cy.animate({ fit: { eles: neighborhood, padding: 60 } }, { duration: 400 });
+    box.innerHTML = hits.map((h, i) =>
+      `<div class="hit-item" data-i="${i}"><div class="name">${esc(h.name)}</div>`
+      + `<div class="muted" style="font-size:12px">${esc(h.type)}</div></div>`).join('');
+    box.querySelectorAll('.hit-item').forEach(el => {
+      const h = hits[+el.dataset.i];
+      el.onclick = () => {
+        const n = cy.getElementById(h.graph_node_no);
+        if (n.length) { cy.animate({ center: { eles: n }, zoom: 1.5 }, { duration: 300 }); n.select(); showNodeDetail(n.data()); }
+      };
+    });
+  } catch (e) { box.innerHTML = `<div class="muted">匹配失败: ${esc(e.message)}</div>`; }
+}
+
+document.getElementById('entBtn').onclick = doEntity;
+document.getElementById('entInput').addEventListener('keydown', e => { if (e.key === 'Enter') doEntity(); });
+document.getElementById('graphReset').onclick = () => { clearHighlight(); loadFullGraph(true); };
+
+// ---- init ----
+loadGraphs();
+</script>
+</body>
+</html>

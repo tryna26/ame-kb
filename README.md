@@ -1,21 +1,22 @@
 # ame-kb
 
-一个可本地运行的知识图谱构建器（V3）：扫描文档，使用 LLM 抽取实体与关系，原子写入 MySQL，再通过独立的实体消解步骤把跨文档的同一实体合并为 canonical Node。
+面向 AI Agent 的 Knowledge Recall / Memory 服务内核（当前 V6.2）：多源文档 → 后台 Pipeline → LLM 抽取实体与关系 → MySQL 图存储 → 全文/向量混合召回 → 多图谱版本化增量构建。
 
-V3 保留 V2 的多格式输入、半动态属性、内容 hash 增量和边置信度，并新增：
+目前已交付 V1～V5、V6.1 版本化基础，以及 V6.2 的持久化任务、后台 worker、逐文档 checkpoint、失败重试和进度查询。REST/MCP 和 UI 仍在后续 V6 阶段。
 
-- 与名称解耦的稳定 Node Identity：`node:{uuid}`；
-- 旧 `type:slug(name)` 标识到新 UUID 的兼容映射；
-- 按文档替换贡献与内容 hash 的单事务写入；
-- 同类型内的 exact/alias blocking、向量召回和灰区 LLM Judge；
-- merge 审计、回滚、alias 查询，以及 legacy/loser ID 到 survivor 的重定向。
+核心表包括：
+- `kg_domain_entity`：类型定义层（schema），V1 由固定 schema 写入种子
+- `kg_graph_node`：实例节点
+- `kg_graph_edge`：实例边
+- `kg_doc_version`（V2）：文档内容 SHA-256 快照，用于增量跳过未变文档
+- `kg_graph` / `kg_graph_file`（V6.1）：图谱版本生命周期和跨版本文件清单
+- `kg_task` / `kg_pipeline_run` / `kg_pipeline_step`（V6.2）：后台任务、运行记录和逐文档 checkpoint
 
 ## 环境要求
 
 - Python 3.9+
-- MySQL 8.0
-- OpenAI-compatible chat completion endpoint
-- OpenAI-compatible embeddings endpoint；可以与 chat endpoint 共用 key 和 base URL，不需要单独部署向量数据库
+- 一个 MySQL 8.0 实例（本地或云端，如阿里云 RDS）
+- 一个 OpenAI 兼容的 LLM endpoint（key + base_url + model）
 
 ## 安装
 
@@ -24,147 +25,157 @@ cd ame-kb
 python3 -m pip install -e .
 ```
 
-也可以不安装，使用 `PYTHONPATH=src python3 -m ame_kb.cli ...`，以确保加载的是当前工作区代码。
-
 ## 配置
 
-复制 `.env.example` 为 `.env`，至少配置：
+复制 `.env.example` 为 `.env` 并填写：
 
-```dotenv
-LLM_API_KEY=...
-LLM_BASE_URL=https://.../v1
-LLM_MODEL=...
-
-# KEY 和 BASE_URL 未设置时回退到对应 LLM_*；模型和维度必须显式设置
-EMBED_API_KEY=...
-EMBED_BASE_URL=https://.../v1
-EMBED_MODEL=...
-EMBED_DIM=1024                   # 必须与 provider 实际输出维度一致
+```
+LLM_API_KEY=...                 # LLM key
+LLM_BASE_URL=https://.../v1     # OpenAI 兼容 endpoint（SDK 会在其后拼 /chat/completions）
+LLM_MODEL=...                   # 模型名
 
 MYSQL_DSN=mysql+pymysql://user:pass@host:3306/kb?charset=utf8mb4
-SOURCE_DIR=./data
-# 可选：同一图中区分不同来源根目录；配置后应保持稳定
-SOURCE_ID=local-docs
+SOURCE_DIR=./data               # 待扫描的文档目录
 
-GRAPH_NO=default
-GRAPH_VERSION=1
-
-# 必须满足 0 <= LOW < HIGH <= 1
-RESOLVE_LOW_THRESHOLD=0.75
-RESOLVE_HIGH_THRESHOLD=0.92
-RESOLVE_CANDIDATE_TOPK=10
+GRAPH_NO=default                # 默认图谱；CLI --graph-no 可按请求覆盖
+GRAPH_VERSION=1                # 默认版本；托管图谱不指定时只解析最新 ACTIVE 版本
 ```
 
-`.env` 已被 `.gitignore` 忽略。首次初始化需要目标数据库的建表和变更表权限；日常 ingest/resolve 还需要读写权限。
+`.env` 已在 `.gitignore` 中，不会被提交。
 
-## 初始化与迁移
+### 数据库权限提示
 
-新库：
+首次 `init-db` 需要账号对目标库有 `CREATE / INSERT / UPDATE / DELETE` 权限。
+阿里云 RDS 的默认账号常被裁剪权限，需在控制台「账号管理」给目标库授「读写」。
 
-```bash
-python3 -m ame_kb.cli init-db
-```
-
-`init-db` 会检查连通性、应用基础 DDL、确保 V3 schema 已存在，并写入固定 ontology 种子。
-
-已有 V1/V2 数据库按以下顺序升级；执行前先备份：
+## 使用
 
 ```bash
-# 1. 先安装/更新代码，再补齐 V3 schema
+# 1. 探测连通性 + 建所有表（sql/*.sql 按序执行）+ 写入固定 schema 种子（幂等，可重复跑）
 python3 -m ame_kb.cli init-db
 
-# 2. 把旧 type:slug(name) ID 迁移为 node:{uuid}，同步边端点并保留 legacy 映射
-python3 -m ame_kb.cli migrate-identity
-
-# 3. 迁移后做一次只读检查
-python3 -m ame_kb.cli query "已知实体名" --no-relations
-```
-
-不要在 `migrate-identity` 前用 V3 ingest 写入旧库。迁移命令会输出迁移的节点、边、alias 和贡献记录数量；重复运行应只处理尚未迁移的数据。
-V1/V2 的聚合属性没有逐文档归因：若一个旧节点/边引用多篇文档，迁移只回填结构和各文档 ref，不把整份聚合属性复制到每篇贡献。迁移后应对这些来源执行一次全量 `ingest --force`，再以真实文档重建可撤销的属性贡献。
-
-## Ingest → Resolve → Query
-
-把 `.md`、`.txt`、`.pdf` 或 `.html` 文件放入 `SOURCE_DIR`，然后运行：
-
-```bash
-# 只检查抽取结果；不写图数据或文档 hash
+# 2. 干跑：抽取并打印结果，不写库、不记 hash（用于检查抽取质量）
 python3 -m ame_kb.cli ingest --dry-run
 
-# 增量写入。单个文档的贡献替换和 hash 更新在同一事务提交
+# 3. 真正入库（增量：内容未变的文档自动跳过）
 python3 -m ame_kb.cli ingest
 
-# 忽略未变 hash，强制重新抽取并替换该文档的旧贡献
+# 3b. 强制重抽（忽略 hash）
 python3 -m ame_kb.cli ingest --force
 
-# 先观察本轮实体消解判断，不执行 merge
-python3 -m ame_kb.cli resolve --dry-run
-
-# 可限定类型和本轮最多扫描的 seed Node 数
-python3 -m ame_kb.cli resolve --type Person --limit 10
-
-# 查询 canonical name 或 alias，并展示 survivor 的一跳关系
+# 4. 按名查实体 + 一跳直接关系
 python3 -m ame_kb.cli query "Ada"
+
+# 5. 跨文档实体融合（V5）：向量/全文找相似候选 → LLM 批量同义聚类 → 合并
+python3 -m ame_kb.cli resolve --dry-run   # 只打印聚类结果，不写库
+python3 -m ame_kb.cli resolve             # 真正融合（记别名 + 可回滚审计）
+python3 -m ame_kb.cli resolve --type Person   # 只融合某类型
+python3 -m ame_kb.cli resolve --prune     # 融合后再软删低支持度长尾节点（可回滚）
+
+# 5b. 回滚某次合并（按 merge_id，从审计快照还原）
+python3 -m ame_kb.cli rollback-merge <merge_id>
+
+# 5c. 查看某主实体的别名（验证「别名搜到主实体」）
+python3 -m ame_kb.cli alias-of "Ada Lovelace"
+
+# 辅助：查看某 type/name 的业务键（graph_node_no）；Asset 用 --spec 指定原型
+python3 -m ame_kb.cli node-no Asset "Login" --spec Solution
+python3 -m ame_kb.cli node-no Event "Order.Placing"
 ```
 
-`ingest` 只持久化文档里的 Mention，不做跨文档合并。`resolve` 才执行全局实体消解：
-
-1. 只在相同 Entity Type 内生成候选；每个 Node 的候选数由 `RESOLVE_CANDIDATE_TOPK` 控制。
-2. exact name/alias 命中直接合并。
-3. 否则计算向量相似度：`score >= HIGH` 自动合并。
-4. `LOW <= score < HIGH` 才调用 LLM Judge；`score < LOW` 保持为不同 Node。
-5. merge 后 loser 软删除并指向 survivor；边重定向到 survivor，同时清理自环和重复边。
-
-查询只返回 active canonical survivor。旧 ID、loser ID 和 alias 都会解析到 survivor，因此历史引用仍可用于关系查询。
-
-## Identity、alias 与回滚命令
+### 多图谱版本化工作流（V6.1）
 
 ```bash
-# 按现有 type/name（也接受精确 alias）查询已存储 UUID；不再计算 type:slug(name)
-python3 -m ame_kb.cli node-no Person "Ada Lovelace"
+# 注册托管图谱，记录输出的 graph_no（例如 graph_a1b2c3d4）
+python3 -m ame_kb.cli create-graph --name "Agent Memory"
 
-# 查看 canonical Node 的 aliases；参数可用 UUID 或精确名称
-python3 -m ame_kb.cli alias-of node:00000000-0000-0000-0000-000000000000
+# 维护该图谱的文件清单
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 add-file ./data
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 list-files
 
-# 使用 merge 审计记录中的 merge_id 撤销一次 merge
-python3 -m ame_kb.cli rollback-merge MERGE_ID
+# 首次填充 v1；后续运行自动派生 vN+1
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 ingest
+
+# 默认只查询最新 ACTIVE 版本；也可显式固定历史版本
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 search "Ada 做过什么？"
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 --graph-version 1 search "Ada 做过什么？"
+
+# 渐进式探索：同一 --state-id 复用于多次搜索，自动排除已返回过的节点（追问式深挖不重复）
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 search "登录怎么实现的" --state-id sess-42
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 search "还有别的吗" --state-id sess-42
 ```
 
-Node UUID 是持久身份，不能由名称推导。`node-no` 现在是数据库 lookup；无匹配或同类型下结果不唯一时会失败并列出候选。
+派生新版本时，未变化文档的节点、边、原文和搜索索引会直接继承，embedding 不会重新计算；只有新增/变化文档调用 LLM。构建中的 `BUILDING` 版本不会成为默认查询版本，中断构建可在下一次 `ingest` 时续跑。图谱选择通过请求/任务级 `GraphContext` 隔离，不修改进程级环境变量。
 
-## 数据与消解语义
+### 后台 Pipeline（V6.2）
 
-- 类型仍由 `src/ame_kb/schema.py` 的固定 ontology 约束；额外节点属性保存在 `properties`。
-- 每条边的 `confidence` 为 `EXTRACTED`、`INFERRED` 或 `AMBIGUOUS`。
-- 文档贡献是重 ingest 的事实来源：内容变化时替换该文档的旧贡献，再重算受影响的节点和边。
-- merge 采用 survivor-wins：survivor 的非空属性优先，loser 补空缺；alias 和来源取并集，重复边保留更高置信度。
-- 同一 `(graph_no, graph_version)` 的 ingest、merge、rollback 和 identity migration 通过数据库写锁串行化，避免贡献聚合丢更新和反向锁序死锁；不同图版本仍可并行。
-- embedding 由 `resolve` 懒计算并缓存于 MySQL；候选相似度在进程内计算。这里没有 Redis、Milvus、FAISS 或本地 embedding 模型依赖。
-
-设计背景见 [CONTEXT.md](CONTEXT.md)、[ADR-0001](docs/adr/0001-node-identity-decoupled-from-name.md) 和 [ADR-0002](docs/adr/0002-embeddings-without-vector-store.md)。
-
-## 测试与验收边界
-
-离线测试：
+先运行 `init-db` 应用 `007_pipeline.sql`，然后可把同步 `ingest` 替换为后台任务：
 
 ```bash
-PYTHONPATH=src python3 -m pytest tests/ -q
+# 清单在入队时快照；同一图谱同时只保留一个活动任务
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 enqueue-ingest
+
+# 常驻 worker；也可用 --once 处理一个任务后退出
+python3 -m ame_kb.cli worker
+python3 -m ame_kb.cli worker --once
+
+# 查询总体进度和每个文档的 checkpoint
+python3 -m ame_kb.cli task-status task_<id>
+python3 -m ame_kb.cli --graph-no graph_a1b2c3d4 list-tasks
+
+# 自动重试预算耗尽后，可人工恢复；已完成文档不会重新调用 LLM
+python3 -m ame_kb.cli retry-task task_<id> --max-attempts 3
 ```
 
-离线测试使用 mock/内存数据库时，不代表以下外部能力已经验证：真实 MySQL 8 DDL 和事务、真实 embeddings/chat endpoint、RDS 权限与网络，以及生产数据迁移。对目标环境至少执行：
+MySQL 是任务状态的权威存储。默认 `PIPELINE_QUEUE_BACKEND=database` 直接轮询 MySQL；切到 `redis` 后，Redis 只承载低延迟唤醒消息，worker 仍从 MySQL 原子认领任务，因此 Redis 消息丢失或重复不会丢任务。`PIPELINE_REDIS_URL` 应使用与 RediSearch db 0 分开的 DB 或实例。
+
+任务状态流转为 `QUEUED → RUNNING → SUCCEEDED`；失败时在预算内回到 `QUEUED`，耗尽后进入 `FAILED`。worker 认领任务时写入 lease，进程异常退出后，新 worker 会回收过期 lease 并从已落库的文档 checkpoint 继续。
+
+把你的 `.md` / `.txt` / `.pdf` / `.html` 文件放进 `SOURCE_DIR`（默认 `./data`）即可被扫描抽取。
+
+## 抽取机制
+
+- **多源接入（V2）**：`src/ame_kb/sources.py` 按后缀分发 loader，把 md/txt/pdf/html 统一转成纯文本 `Document`。PDF 用 `pypdf`，网页正文用 `trafilatura`。下游抽取路径与源格式无关。
+- **固定本体分层 + 半动态属性（V7）**：节点/边的**类型**是一套固定的 site 式本体（`src/ame_kb/schema.py`，纯静态，不查库）：
+  - 元类型（`GraphNode.type`，4 选 1）：`Asset / Relation / Event / Behavior`
+  - Asset 的原型（`GraphNode.entity_spec`，5 选 1）：`Mission`（为什么做）/ `Solution`（怎么做）/ `Implementation`（静态产物）/ `ServiceInstance`（运行实例）/ `Artifact`（兜底成品）；非 Asset 节点 `entity_spec` 为 NULL。
+  - 业务名（`name`）开放：英文 PascalCase，不带原型后缀；禁泛化词（System/Service/Module/Platform/Manager/Handler/Component/Config）。
+  - 数量与质量约束（写进 prompt）：Asset 3–5、Event+Behavior ≤8、关系 5–12；配合 OntoClean（刚性/身份/独立性）+ DDD 判定晋级 vs 并入属性。
+  - 但节点**属性**放开：本体之外，LLM 抽到的额外属性也全部保留进 `properties` JSON 兜底（不再像 V1 那样按白名单丢弃）。
+- **填空式抽取**：prompt（`src/ame_kb/prompts/extract_v2.txt`）把本体定义注入（`schema.schema_prompt_block`），让 LLM 只能输出上述元类型/原型，不能发明新类型。
+- **边置信标签（V2）**：每条边带 `confidence ∈ {EXTRACTED, INFERRED, AMBIGUOUS}`（借鉴 Graphify），存入 `kg_graph_edge.properties`。LLM 抽取默认 `INFERRED`；入库前校验非法置信值会被丢弃。
+- **行号来源**：文档每行加 `[N] ` 前缀，LLM 在 `source` 里回填行范围，便于溯源。
+- **入库校验**：非法 `entity_type`、Asset 缺/错 `entity_spec`、端点不在本次节点集合、非法 `confidence` 都会被丢弃（`extract.py: validate`）。
+- **去重（V7 分层）**：Asset 的 `graph_node_no = type:entity_spec:slug(name)`，非 Asset 为 `type:slug(name)`。同名但不同原型的 Asset（如 `Login` 的 Mission/Solution/Implementation）是**不同节点**，可用关系串成价值链；精确同层同名在写入时天然合并（upsert）。跨文档「同实体不同写法」由 V5 的 `resolve` 融合处理。
+- **增量（V2）**：入库前算 `sha256(正文)` 与 `kg_doc_version` 中最新 hash 比对，未变则跳过抽取。hash 在**成功入库后**才记录，抽取失败不会污染缓存。`--force` 可绕过。
+
+## 实体融合（V5）
+
+`resolve` 把跨文档指向同一现实实体、但名字不同的节点合并为一个 canonical 主实体（`src/ame_kb/resolve.py`）：
+
+- **候选召回**：对每个节点用其 `name + description + properties` 走 `HybridIndex.search`（向量 KNN + 全文，RRF 融合，复用 V4 检索栈）拿相似候选，排除自身。范式借鉴 general_recall 的双通道候选召回。
+- **批量同义聚类**：把种子 + 其同一本体类型的候选一次性交给 LLM（`prompts/resolve_cluster.txt`），让它把「同一现实实体的不同命名」归为若干簇，每簇给出「更完整的规范名」（采用 Graphiti「返回最完整全名」的规范化方式）。相比逐对判定，单个种子只需一次 LLM 调用，数据量大时显著省 token。LLM/JSON 失败一律返回空（不合并），且只采用模型复用的已知名字（不接受新造名）。
+- **字段并集融合**：`properties` 主实体优先、被合并方补空缺；`ref`（溯源行号）按 doc_id 并集；`description` 取更完整的一个。
+- **边重挂 canonical**：被合并节点上的边端点改挂到主实体（借鉴 general_recall `node_retriever`）。重挂后若与既有边 `edge_no` 撞键则合并并去重；塌成自环的边丢弃。
+- **低支持度剪枝（可选，默认关闭）**：合并后可选做一遍长尾剪枝：软删只出现在少于 `RESOLVE_PRUNE_MIN_SUPPORT` 篇文档（`len(ref)`）、且没有任何活跃边引用的噪声节点；被边引用的节点一律保护，避免打断真实关系。每次剪枝同样快照进 `kg_merge_log`（status=`PRUNED`），可 `rollback-merge` 还原。通过 `resolve --prune` 或 `RESOLVE_PRUNE_ENABLED=true` 开启。
+- **别名 + 可回滚审计**：被合并方的名字（及被改名时主实体的旧名）写入 `kg_entity_alias`，reindex 时并进主实体的 `searchable_text`，于是**别名也能搜到主实体**；每次合并把 loser 全量 + 边端点原值快照进 `kg_merge_log`，`rollback-merge <merge_id>` 可完整还原。
+
+## 数据库结构
+
+见 `sql/*.sql`（`init-db` 按序执行）。所有表均带 `graph_no / graph_version`，为后续多版本演进预留。V5 新增 `kg_entity_alias`（别名 → 主实体）与 `kg_merge_log`（合并审计快照，支持回滚）。
+
+## 测试
 
 ```bash
-python3 -m ame_kb.cli init-db
-python3 -m ame_kb.cli migrate-identity
-python3 -m ame_kb.cli ingest --dry-run
-python3 -m ame_kb.cli resolve --dry-run --limit 3
-python3 -m ame_kb.cli query "已知实体名"
+python3 -m pytest tests/ -q
 ```
 
-`ingest --dry-run` 会调用抽取 LLM；`resolve --dry-run` 可能调用 embeddings 和灰区 Judge，但不执行 merge。请用非生产样本先验证 endpoint、模型维度和阈值，再对正式图运行写入命令。
+离线测试（不连 DB/LLM）覆盖：schema 校验、半动态属性保留、node_no 去重、JSON 解析容错、源分发、内容 hash、边置信默认值与校验。V5 追加实体融合/回滚全链路；V6.1 追加 ACTIVE 版本隔离、GraphContext 隔离和增量版本投影；V6.2 追加任务去重、逐文档 checkpoint、自动/人工重试、lease 回收和 Redis 通知队列。
 
-## 后续方向
+## 后续版本（规划）
 
-- 代码源 tree-sitter 确定性抽取
-- 异步 pipeline 与图可视化
-- 对外 MCP server
+- ~~V5：跨文档实体去重与融合（向量召回 + LLM 判同）+ 别名可回滚 + 半动态 schema~~（已完成）
+- V6.1：多图谱版本化增量构建 + ACTIVE 版本隔离 + 请求级 GraphContext（已完成）
+- V6.2：持久化后台 pipeline + 逐文档 checkpoint + 进度/失败重试/lease 恢复（已完成）
+- V6.3～V6.4：REST/MCP server + 图可视化 UI
+- V7（可选）：schema 自动演化、多租户权限隔离、图数据库迁移（Neo4j）、社区发现
